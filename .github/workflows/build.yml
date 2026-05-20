@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-ps-exe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install mips toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make g++-mipsel-linux-gnu
+
+      - name: Show toolchain versions
+        run: |
+          mipsel-linux-gnu-g++ --version
+          make --version
+
+      - name: Build (Release)
+        run: |
+          make BUILD=Release -j$(nproc)
+
+      - name: List build artifacts
+        run: |
+          ls -la
+          file ps1-acid-rom.ps-exe || true
+
+      - name: Upload ps-exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps1-acid-rom-ps-exe
+          path: |
+            ps1-acid-rom.ps-exe
+            ps1-acid-rom.map
+          if-no-files-found: error
+
+  host-tests:
+    # Host-side DSP tests live in host_tests/ (added in M2-prep). Skipped
+    # gracefully until that folder exists with a CMakeLists.txt.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Run host DSP tests if present
+        run: |
+          if [ -f host_tests/CMakeLists.txt ]; then
+            sudo apt-get update
+            sudo apt-get install -y cmake g++
+            cmake -S host_tests -B host_tests/build -DCMAKE_BUILD_TYPE=Release
+            cmake --build host_tests/build -j
+            ctest --test-dir host_tests/build --output-on-failure
+          else
+            echo "host_tests/ not present yet — skipping."
+          fi

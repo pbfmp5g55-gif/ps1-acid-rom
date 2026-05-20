@@ -1,0 +1,26 @@
+# Build artifacts
+*.o
+*.elf
+*.ps-exe
+*.cpe
+*.iso
+*.bin
+*.cue
+*.map
+*.dep
+*.d
+
+# Host test outputs
+host_tests/build/
+host_tests/*.wav
+# Rendered wav scratch (any *.wav at root)
+/*.wav
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Allow PS1 BIOS / iso / build artifacts ONLY when explicitly named
+!third_party/nugget/**
