@@ -13,16 +13,25 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #   - tune envelope decays / mod amounts against a reference recording
 add_library(dsp STATIC
     ../src/dsp/bd_tbridge.cpp
+    ../src/dsp/sd_twint.cpp
+    ../src/dsp/tom_tbridge.cpp
+    ../src/dsp/hh_six_squares.cpp
+    ../src/dsp/cy_six_squares.cpp
+    ../src/dsp/cp_burst.cpp
+    ../src/dsp/cb_tbridge.cpp
 )
 target_include_directories(dsp PUBLIC ../src)
 
-# wav writer + per-voice "render N seconds to a file" CLI
-add_executable(render_bd render_bd.cpp wav_writer.cpp)
-target_link_libraries(render_bd PRIVATE dsp)
+# Per-voice "render N seconds to a file" CLIs.
+foreach(voice bd sd tom hh cy cp cb)
+    add_executable(render_${voice} render_${voice}.cpp wav_writer.cpp)
+    target_link_libraries(render_${voice} PRIVATE dsp)
+endforeach()
 
-# ctest-driven sanity tests
+# ctest-driven sanity tests.
 enable_testing()
-
-add_executable(test_bd_basic test_bd_basic.cpp)
-target_link_libraries(test_bd_basic PRIVATE dsp)
-add_test(NAME bd_basic COMMAND test_bd_basic)
+foreach(voice bd sd tom hh cy cp cb)
+    add_executable(test_${voice}_basic test_${voice}_basic.cpp)
+    target_link_libraries(test_${voice}_basic PRIVATE dsp)
+    add_test(NAME ${voice}_basic COMMAND test_${voice}_basic)
+endforeach()
