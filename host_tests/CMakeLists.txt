@@ -20,18 +20,20 @@ add_library(dsp STATIC
     ../src/dsp/cp_burst.cpp
     ../src/dsp/cb_tbridge.cpp
     ../src/dsp/tb303_stage1.cpp
+    ../src/dsp/r909_bd.cpp
+    ../src/dsp/r909_sd.cpp
 )
 target_include_directories(dsp PUBLIC ../src)
 
 # Per-voice "render N seconds to a file" CLIs.
-foreach(voice bd sd tom hh cy cp cb tb303)
+foreach(voice bd sd tom hh cy cp cb tb303 r909bd r909sd)
     add_executable(render_${voice} render_${voice}.cpp wav_writer.cpp)
     target_link_libraries(render_${voice} PRIVATE dsp)
 endforeach()
 
 # ctest-driven sanity tests.
 enable_testing()
-foreach(voice bd sd tom hh cy cp cb tb303)
+foreach(voice bd sd tom hh cy cp cb tb303 r909bd r909sd)
     add_executable(test_${voice}_basic test_${voice}_basic.cpp)
     target_link_libraries(test_${voice}_basic PRIVATE dsp)
     add_test(NAME ${voice}_basic COMMAND test_${voice}_basic)
