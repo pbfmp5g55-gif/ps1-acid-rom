@@ -1,22 +1,20 @@
 // ps1-acid-rom — PS1 sequencer inspired by ReBirth RB-338.
 //
-// Current milestone slice: M1 (UI skeleton) over M2 (SPU integration).
-//   - Four voice rows (303 A / 303 B / 808 / 909) stacked vertically.
-//   - Each row carries a 16-step grid drawn as small LED rectangles.
-//   - Pad navigates the cursor (D-pad), Cross toggles the current step,
-//     Square clears the selected row, Start toggles play/pause, Triangle
-//     swaps the BD/HH/TB-303 sample assignment as a quick variant knob.
-//   - During playback (~112 BPM at 60 Hz NTSC, 8 frames per step), active
-//     steps trigger the SPU samples uploaded by M2.
-//
-// Until M5 / M7 land properly:
-//   - 303A and 303B both fire the TB-303 sample (no per-row pitch yet —
-//     deferred to M2-live or M5b).
-//   - 808 fires BD, 909 fires HH. CY/CP/CB/SD/Tom are pre-rendered into
-//     samples but not bound to UI rows yet.
-//
-// DSP voices themselves are not linked into the PS1 build (no libm); the
-// samples were generated bit-exact host-side by host_tests/gen_voice_samples.
+// State of the build:
+//   - 4 voice rows (303 A / 303 B / 808 / 909) × 16 step grid, drawn with
+//     Prim::Rectangle LEDs.
+//   - Each row holds an index into a 9-voice sample table; Triangle / Circle
+//     cycle through the voices for the row under the cursor. Default mapping
+//     is 303 A → TB-303 Saw, 303 B → TB-303 Square, 808 → BD, 909 → HH, but
+//     anything goes — drop TB-303 on the 909 row if you want.
+//   - SimplePad pad 1: D-pad cursor, Cross = step toggle, Square = clear row,
+//     Start = play/pause, Triangle / Circle = next / prev voice for the
+//     cursor row.
+//   - All voice samples were rendered host-side by host_tests/gen_voice_samples
+//     (same C++ DSP source as the host tests) and embedded as PSX ADPCM in
+//     src/generated/voice_samples.h. The PS1 build does not link the DSP
+//     voices directly because we don't pull in libm; that's deferred to
+//     M2-live.
 
 #include "psyqo/application.hh"
 #include "psyqo/font.hh"
@@ -30,42 +28,45 @@
 
 namespace {
 
-// SPU RAM layout — addresses are byte-offsets; 0x1000 is the silent dummy.
-constexpr uint32_t SPU_BASE       = 0x1100;
-constexpr uint32_t BD_SPU_ADDR    = SPU_BASE;
-constexpr uint32_t HH_SPU_ADDR    = BD_SPU_ADDR + acid::voice_samples::bd_adpcm_bytes;
-constexpr uint32_t TB303_SPU_ADDR = HH_SPU_ADDR + acid::voice_samples::hh_adpcm_bytes;
-
 constexpr uint16_t HALF_RATE = 0x0800;     // 22 050 Hz source → native pitch
 constexpr uint32_t HOLD_ADSR = 0x1fff80ff; // hold-and-release envelope
 
-// One SPU channel per row keeps voices independent (303A and 303B will
-// drift apart once we add per-row pitch).
-constexpr uint8_t CH_PER_ROW[4] = {0, 1, 2, 3};
+constexpr int NUM_ROWS  = 4;
+constexpr int NUM_STEPS = 16;
+constexpr int FRAMES_PER_STEP = 8;          // ~112 BPM @ 60 Hz NTSC
 
-// Per-row sample address and volume. Index matches m_pattern row.
-struct RowVoice {
-    uint32_t spuAddr;
+constexpr int NUM_VOICES = 9;
+
+struct VoiceDef {
+    const char *name;        // ≤3 chars for inline label
+    const uint8_t *data;
+    unsigned bytes;
     uint16_t volume;
-};
-constexpr RowVoice ROW_VOICES[4] = {
-    {TB303_SPU_ADDR, 0x2800},  // 303 A
-    {TB303_SPU_ADDR, 0x2800},  // 303 B (same sample for now)
-    {BD_SPU_ADDR,    0x3000},  // 808 BD
-    {HH_SPU_ADDR,    0x1800},  // 909 HH
+    uint32_t spuAddr;        // computed at boot from running total
 };
 
-constexpr int FRAMES_PER_STEP = 8;  // ~112 BPM @ 60 Hz NTSC, 16th notes
-constexpr int NUM_ROWS        = 4;
-constexpr int NUM_STEPS       = 16;
+VoiceDef g_voices[NUM_VOICES] = {
+    {"BD",  acid::voice_samples::bd_adpcm,           acid::voice_samples::bd_adpcm_bytes,           0x3000, 0},
+    {"SD",  acid::voice_samples::sd_adpcm,           acid::voice_samples::sd_adpcm_bytes,           0x2400, 0},
+    {"TOM", acid::voice_samples::tom_adpcm,          acid::voice_samples::tom_adpcm_bytes,          0x2800, 0},
+    {"HH",  acid::voice_samples::hh_adpcm,           acid::voice_samples::hh_adpcm_bytes,           0x1800, 0},
+    {"CY",  acid::voice_samples::cy_adpcm,           acid::voice_samples::cy_adpcm_bytes,           0x1c00, 0},
+    {"CP",  acid::voice_samples::cp_adpcm,           acid::voice_samples::cp_adpcm_bytes,           0x2000, 0},
+    {"CB",  acid::voice_samples::cb_adpcm,           acid::voice_samples::cb_adpcm_bytes,           0x1c00, 0},
+    {"SAW", acid::voice_samples::tb303_saw_adpcm,    acid::voice_samples::tb303_saw_adpcm_bytes,    0x2800, 0},
+    {"SQR", acid::voice_samples::tb303_square_adpcm, acid::voice_samples::tb303_square_adpcm_bytes, 0x2400, 0},
+};
 
-// Layout constants (320 x 240, NTSC).
+constexpr uint8_t CH_PER_ROW[NUM_ROWS] = {0, 1, 2, 3};
+
+// Layout constants (320 x 240, NTSC). LED row spans x = LEDS_X0 .. LEDS_END.
 constexpr int ROW_HEIGHT = 32;
 constexpr int ROW_Y0     = 24;
 constexpr int LED_W      = 12;
 constexpr int LED_H      = 12;
 constexpr int LED_GAP    = 2;
-constexpr int LEDS_X0    = 64;
+constexpr int LEDS_X0    = 56;
+constexpr int LEDS_END   = LEDS_X0 + NUM_STEPS * (LED_W + LED_GAP);  // = 56 + 224 = 280
 
 constexpr psyqo::Color ROW_COLORS[NUM_ROWS] = {
     {{.r = 200, .g = 50,  .b = 30 }},  // 303 A — orange-red
@@ -79,13 +80,13 @@ void uploadVoice(uint32_t spuAddr, const uint8_t *data, unsigned bytes) {
     psyqo::SPU::dmaWrite(spuAddr, data, static_cast<uint16_t>(bytes), 16);
 }
 
-void triggerVoice(uint8_t channel, uint32_t spuAddr, uint16_t volume) {
+void triggerVoice(uint8_t channel, const VoiceDef &v) {
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     cfg.sampleRate.value = HALF_RATE;
-    cfg.volumeLeft  = volume;
-    cfg.volumeRight = volume;
+    cfg.volumeLeft  = v.volume;
+    cfg.volumeRight = v.volume;
     cfg.adsr = HOLD_ADSR;
-    psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(spuAddr), cfg, true);
+    psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(v.spuAddr), cfg, true);
 }
 
 class AcidRom final : public psyqo::Application {
@@ -108,32 +109,26 @@ class SequencerScene final : public psyqo::Scene {
     void advancePlayback();
 
     uint16_t m_pattern[NUM_ROWS] = {
-        // Default seed pattern so first boot has something audible.
-        0b0010001000100010,  // 303A: off-beats
-        0b0000000000000000,  // 303B: empty
-        0b1000100010001000,  // 808 BD: 4-on-the-floor (LSB = step 0)
-        0b0101010101010101,  // 909 HH: every off-eighth
+        0b0010001000100010,  // 303 A
+        0b0000000000000000,  // 303 B
+        0b1000100010001000,  // 808 → BD: 4-on-the-floor (LSB = step 0)
+        0b0101010101010101,  // 909 → HH: off-eighths
     };
+
+    // Default voice mapping. Players can change via Triangle/Circle.
+    int m_voiceIdx[NUM_ROWS] = {7, 8, 0, 3};  // SAW, SQR, BD, HH
+
     int m_cursorRow  = 2;
     int m_cursorStep = 0;
     int m_playStep   = 0;
     uint32_t m_frameCounter = 0;
     bool m_running = true;
 
-    // Edge-detect: which buttons were down on the previous frame.
     uint16_t m_prevButtons[2] = {0, 0};
 };
 
 AcidRom acidRom;
 SequencerScene sequencerScene;
-
-bool justPressed(psyqo::SimplePad::Button b, uint16_t prev) {
-    // SimplePad's m_padData uses inverted bits; isButtonPressed says
-    // (m_padData[1] & (1<<b)) == 0 means pressed. We mirror that.
-    bool nowPressed = acidRom.m_input.isButtonPressed(psyqo::SimplePad::Pad1, b);
-    bool wasPressed = (prev & (1 << b)) == 0;
-    return nowPressed && !wasPressed;
-}
 
 }  // namespace
 
@@ -146,12 +141,16 @@ void AcidRom::prepare() {
     gpu().initialize(config);
 
     psyqo::SPU::initialize();
-    uploadVoice(BD_SPU_ADDR,    acid::voice_samples::bd_adpcm,
-                acid::voice_samples::bd_adpcm_bytes);
-    uploadVoice(HH_SPU_ADDR,    acid::voice_samples::hh_adpcm,
-                acid::voice_samples::hh_adpcm_bytes);
-    uploadVoice(TB303_SPU_ADDR, acid::voice_samples::tb303_adpcm,
-                acid::voice_samples::tb303_adpcm_bytes);
+
+    // Lay out all voice samples linearly in SPU RAM starting at 0x1100
+    // (0x1000 is psyqo's silent dummy loop target). Compute addresses as
+    // we go so adding a voice or resizing one doesn't need manual edits.
+    uint32_t cursor = 0x1100;
+    for (auto &v : g_voices) {
+        v.spuAddr = cursor;
+        uploadVoice(v.spuAddr, v.data, v.bytes);
+        cursor += v.bytes;
+    }
 }
 
 void AcidRom::createScene() {
@@ -183,7 +182,14 @@ void SequencerScene::handleInput() {
     if (press(B::Square)) m_pattern[m_cursorRow] = 0;
     if (press(B::Start))  m_running = !m_running;
 
-    // Capture button bitmap for next-frame edge detection.
+    // Triangle: next voice for cursor row. Circle: previous.
+    if (press(B::Triangle)) {
+        m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + 1) % NUM_VOICES;
+    }
+    if (press(B::Circle)) {
+        m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + NUM_VOICES - 1) % NUM_VOICES;
+    }
+
     uint16_t bits = 0;
     for (int b = 0; b < 16; ++b) {
         if (!pad.isButtonPressed(psyqo::SimplePad::Pad1, static_cast<B>(b))) {
@@ -200,9 +206,7 @@ void SequencerScene::advancePlayback() {
     m_playStep = (m_frameCounter / FRAMES_PER_STEP) % NUM_STEPS;
     for (int row = 0; row < NUM_ROWS; ++row) {
         if (m_pattern[row] & (uint16_t(1) << m_playStep)) {
-            triggerVoice(CH_PER_ROW[row],
-                         ROW_VOICES[row].spuAddr,
-                         ROW_VOICES[row].volume);
+            triggerVoice(CH_PER_ROW[row], g_voices[m_voiceIdx[row]]);
         }
     }
 }
@@ -215,10 +219,20 @@ void SequencerScene::drawRow(int row) {
                         {{.x = 8, .y = static_cast<int16_t>(y + 2)}},
                         ROW_COLORS[row]);
 
-    // Cursor row gets a thin highlight bar to its left.
+    // Voice name (3-char abbrev) under the row label.
+    psyqo::Color voiceCol = ROW_COLORS[row];
+    if (row != m_cursorRow) {
+        voiceCol.r >>= 1;
+        voiceCol.g >>= 1;
+        voiceCol.b >>= 1;
+    }
+    acidRom.m_font.print(acidRom.gpu(), g_voices[m_voiceIdx[row]].name,
+                        {{.x = 8, .y = static_cast<int16_t>(y + 18)}},
+                        voiceCol);
+
     if (row == m_cursorRow) {
         psyqo::Prim::Rectangle bar{{{.r = 240, .g = 240, .b = 240}}};
-        bar.position = {{.x = 56, .y = static_cast<int16_t>(y)}};
+        bar.position = {{.x = 48, .y = static_cast<int16_t>(y)}};
         bar.size     = {{.x = 2,  .y = static_cast<int16_t>(LED_H + 8)}};
         acidRom.gpu().sendPrimitive(bar);
     }
@@ -231,13 +245,11 @@ void SequencerScene::drawRow(int row) {
 
         psyqo::Color c = ROW_COLORS[row];
         if (!active) {
-            // Dim background — keep the row's hue but darken heavily.
-            c.r = c.r >> 3;
-            c.g = c.g >> 3;
-            c.b = c.b >> 3;
+            c.r >>= 3;
+            c.g >>= 3;
+            c.b >>= 3;
         }
         if (playing && active) {
-            // Boost — clamp to 0xFF.
             c.r = c.r > 200 ? 255 : c.r + 55;
             c.g = c.g > 200 ? 255 : c.g + 55;
             c.b = c.b > 200 ? 255 : c.b + 55;
@@ -248,9 +260,6 @@ void SequencerScene::drawRow(int row) {
         led.size     = {{.x = LED_W, .y = LED_H}};
         acidRom.gpu().sendPrimitive(led);
 
-        // Cursor outline (white) around the active cursor cell. We draw four
-        // thin rectangles forming the border so we don't need a hollow-rect
-        // primitive.
         if (isCursor) {
             psyqo::Color w{{.r = 255, .g = 255, .b = 255}};
             psyqo::Prim::Rectangle top{w}, bot{w}, lft{w}, rgt{w};
@@ -278,8 +287,9 @@ void SequencerScene::drawStatus() {
         m_running ? white : dim);
     acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom M1",
                         {{.x = 80, .y = 224}}, white);
-    acidRom.m_font.print(acidRom.gpu(), "X:toggle SQ:clear ST:play",
-                        {{.x = 64, .y = 200}}, dim);
+    acidRom.m_font.print(acidRom.gpu(),
+                        "X:tgl SQ:clr ST:run TRI/O:voice",
+                        {{.x = 32, .y = 200}}, dim);
 }
 
 void SequencerScene::frame() {
