@@ -33,6 +33,18 @@ namespace {
 constexpr uint16_t HALF_RATE = 0x0800;     // 22 050 Hz source → native pitch
 constexpr uint32_t HOLD_ADSR = 0x1fff80ff; // hold-and-release envelope
 
+// Pitch table — semitones -12..+12 → SPU sampleRate value.
+// Values are 0x800 × 2^(n/12) rounded to nearest integer, so 0 semitones
+// plays at the rendered native pitch (= 22 050 Hz, sampleRate 0x800).
+constexpr uint16_t PITCH_TABLE[25] = {
+    0x0400, 0x043D, 0x047D, 0x04C2, 0x050A, 0x0557, 0x05A8, 0x05FE,
+    0x065A, 0x06BA, 0x0721, 0x078D,
+    0x0800,
+    0x087A, 0x08FB, 0x0983, 0x0A14, 0x0AAD, 0x0B50, 0x0BFC,
+    0x0CB3, 0x0D74, 0x0E41, 0x0F1A, 0x1000,
+};
+constexpr int PITCH_TABLE_ZERO = 12;
+
 constexpr int NUM_ROWS  = 4;
 constexpr int NUM_STEPS = 16;
 constexpr int FRAMES_PER_STEP = 8;          // ~112 BPM @ 60 Hz NTSC
@@ -154,11 +166,33 @@ void uploadVoice(uint32_t spuAddr, const uint8_t *data, unsigned bytes) {
     psyqo::SPU::dmaWrite(spuAddr, data, static_cast<uint16_t>(bytes), 16);
 }
 
-void triggerVoice(uint8_t channel, const VoiceDef &v) {
+// Per-row knob state (M-Design / knob page). Values are 0..255 except
+// `pitch` which is a signed semitone offset in [-12, +12]. `level` and
+// `pitch` are realised by the SPU on the next triggerVoice() call; the
+// other knobs (tone, decay) are stored but only audible once M2-live (PS1
+// runtime DSP render) lands. WAVE / REVERB SEND are tracked elsewhere
+// (voice index + reverb namespace).
+struct RowKnobs {
+    uint8_t level  = 0xC0;
+    int8_t  pitch  = 0;
+    uint8_t tone   = 0x80;
+    uint8_t decay  = 0x80;
+};
+
+constexpr int NUM_KNOBS = 4;
+constexpr const char *KNOB_LABELS[NUM_KNOBS] = {"LVL", "PIT", "TNE", "DCY"};
+
+void triggerVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k) {
     psyqo::SPU::ChannelPlaybackConfig cfg{};
-    cfg.sampleRate.value = HALF_RATE;
-    cfg.volumeLeft  = v.volume;
-    cfg.volumeRight = v.volume;
+    int idx = PITCH_TABLE_ZERO + k.pitch;
+    if (idx < 0) idx = 0;
+    if (idx > 24) idx = 24;
+    cfg.sampleRate.value = PITCH_TABLE[idx];
+    // Scale voice default volume by the per-row level knob.
+    uint32_t vol = (static_cast<uint32_t>(v.volume) * k.level) / 255;
+    if (vol > 0x7FFF) vol = 0x7FFF;
+    cfg.volumeLeft  = static_cast<uint16_t>(vol);
+    cfg.volumeRight = static_cast<uint16_t>(vol);
     cfg.adsr = HOLD_ADSR;
     psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(v.spuAddr), cfg, true);
 }
@@ -179,7 +213,10 @@ class SequencerScene final : public psyqo::Scene {
 
     void drawRow(int row);
     void drawStatus();
+    void drawKnobPage();
     void handleInput();
+    void handleSequencerInput();
+    void handleKnobPageInput();
     void advancePlayback();
 
     // M4: up to 8 patterns in RAM. m_currentPattern is the one being edited
@@ -211,6 +248,11 @@ class SequencerScene final : public psyqo::Scene {
     int m_playStep   = 0;
     uint32_t m_frameCounter = 0;
     bool m_running = true;
+
+    // Knob page state.
+    bool m_knobPage = false;
+    int  m_knobCursor = 0;   // 0..NUM_KNOBS-1
+    RowKnobs m_knobs[NUM_ROWS];
 
     uint16_t m_prevButtons[2] = {0, 0};
 };
@@ -263,38 +305,18 @@ void SequencerScene::handleInput() {
         return now && !wasDown;
     };
 
-    if (press(B::Left))  m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
-    if (press(B::Right)) m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
-    if (press(B::Up))    m_cursorRow  = (m_cursorRow + NUM_ROWS - 1) % NUM_ROWS;
-    if (press(B::Down))  m_cursorRow  = (m_cursorRow + 1) % NUM_ROWS;
-
-    if (press(B::Cross))  m_patterns[m_currentPattern][m_cursorRow] ^= (uint16_t(1) << m_cursorStep);
-    if (press(B::Square)) m_patterns[m_currentPattern][m_cursorRow] = 0;
-    if (press(B::Start))  m_running = !m_running;
-
-    // Triangle: next voice for cursor row. Circle: previous.
-    if (press(B::Triangle)) {
-        m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + 1) % NUM_VOICES;
-    }
-    if (press(B::Circle)) {
-        m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + NUM_VOICES - 1) % NUM_VOICES;
+    // R2 toggles between step-grid view and knob page. Always handled regardless
+    // of which page we're on, so it's the universal "back to other view" button.
+    if (press(B::R2)) {
+        m_knobPage = !m_knobPage;
+        m_knobCursor = 0;
     }
 
-    // L1 / R1: cycle the pattern being edited (0..7).
-    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
-    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
+    if (m_knobPage) handleKnobPageInput();
+    else            handleSequencerInput();
 
-    // Select: cycle chain length 1..NUM_PATTERNS. At length 1 only the
-    // current pattern loops; at higher lengths patterns 0..length-1 cycle.
-    if (press(B::Select)) {
-        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
-        m_chainPos = 0;
-    }
-
-    // L2: toggle global reverb on/off.
-    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
-    // L3: toggle reverb send for the cursor row.
-    if (press(B::L3)) reverb::setRowSend(m_cursorRow, !reverb::rowSend(m_cursorRow));
+    // Start is global — works in both views.
+    if (press(B::Start)) m_running = !m_running;
 
     uint16_t bits = 0;
     for (int b = 0; b < 16; ++b) {
@@ -303,6 +325,106 @@ void SequencerScene::handleInput() {
         }
     }
     m_prevButtons[0] = bits;
+}
+
+void SequencerScene::handleSequencerInput() {
+    using B = psyqo::SimplePad::Button;
+    auto &pad = acidRom.m_input;
+    auto press = [&](B b) {
+        bool now = pad.isButtonPressed(psyqo::SimplePad::Pad1, b);
+        bool wasDown = (m_prevButtons[0] & (1 << b)) == 0;
+        return now && !wasDown;
+    };
+
+    if (press(B::Left))  m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
+    if (press(B::Right)) m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
+    if (press(B::Up))    m_cursorRow  = (m_cursorRow + NUM_ROWS - 1) % NUM_ROWS;
+    if (press(B::Down))  m_cursorRow  = (m_cursorRow + 1) % NUM_ROWS;
+
+    if (press(B::Cross))  m_patterns[m_currentPattern][m_cursorRow] ^= (uint16_t(1) << m_cursorStep);
+    if (press(B::Square)) m_patterns[m_currentPattern][m_cursorRow] = 0;
+
+    if (press(B::Triangle)) m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + 1) % NUM_VOICES;
+    if (press(B::Circle))   m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + NUM_VOICES - 1) % NUM_VOICES;
+
+    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
+    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
+
+    if (press(B::Select)) {
+        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
+        m_chainPos = 0;
+    }
+
+    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
+    if (press(B::L3)) reverb::setRowSend(m_cursorRow, !reverb::rowSend(m_cursorRow));
+}
+
+void SequencerScene::handleKnobPageInput() {
+    using B = psyqo::SimplePad::Button;
+    auto &pad = acidRom.m_input;
+    auto press = [&](B b) {
+        bool now = pad.isButtonPressed(psyqo::SimplePad::Pad1, b);
+        bool wasDown = (m_prevButtons[0] & (1 << b)) == 0;
+        return now && !wasDown;
+    };
+
+    // D-pad left/right moves cursor between knobs. Up/down moves between rows
+    // (so you can edit a different voice without leaving the page).
+    if (press(B::Left))  m_knobCursor = (m_knobCursor + NUM_KNOBS - 1) % NUM_KNOBS;
+    if (press(B::Right)) m_knobCursor = (m_knobCursor + 1) % NUM_KNOBS;
+    if (press(B::Up))    m_cursorRow  = (m_cursorRow + NUM_ROWS - 1) % NUM_ROWS;
+    if (press(B::Down))  m_cursorRow  = (m_cursorRow + 1) % NUM_ROWS;
+
+    // Cross / Square adjust the selected knob's value (- / +).
+    // For PITCH, the step is 1 semitone; for byte-valued knobs it's 0x10
+    // so that a full sweep is 16 presses.
+    auto bump = [&](int delta) {
+        RowKnobs &k = m_knobs[m_cursorRow];
+        switch (m_knobCursor) {
+            case 0: {  // LEVEL
+                int v = static_cast<int>(k.level) + delta * 0x10;
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                k.level = static_cast<uint8_t>(v);
+                break;
+            }
+            case 1: {  // PITCH (signed semitones)
+                int v = k.pitch + delta;
+                if (v < -12) v = -12;
+                if (v >  12) v =  12;
+                k.pitch = static_cast<int8_t>(v);
+                break;
+            }
+            case 2: {  // TONE
+                int v = static_cast<int>(k.tone) + delta * 0x10;
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                k.tone = static_cast<uint8_t>(v);
+                break;
+            }
+            case 3: {  // DECAY
+                int v = static_cast<int>(k.decay) + delta * 0x10;
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                k.decay = static_cast<uint8_t>(v);
+                break;
+            }
+        }
+    };
+    if (press(B::Cross))  bump(+1);
+    if (press(B::Square)) bump(-1);
+
+    // Triangle / Circle still cycle voice — handy from the knob page so you
+    // can sweep the lineup while watching the knob bank.
+    if (press(B::Triangle)) m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + 1) % NUM_VOICES;
+    if (press(B::Circle))   m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + NUM_VOICES - 1) % NUM_VOICES;
+
+    // L1/L2/L3 stay on their sequencer functions so you can flip pattern,
+    // toggle reverb, etc. without going back.
+    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
+    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
+    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
+    if (press(B::L3)) reverb::setRowSend(m_cursorRow, !reverb::rowSend(m_cursorRow));
 }
 
 void SequencerScene::advancePlayback() {
@@ -322,7 +444,7 @@ void SequencerScene::advancePlayback() {
 
     for (int row = 0; row < NUM_ROWS; ++row) {
         if (m_patterns[m_playingPattern][row] & (uint16_t(1) << m_playStep)) {
-            triggerVoice(CH_PER_ROW[row], g_voices[m_voiceIdx[row]]);
+            triggerVoice(CH_PER_ROW[row], g_voices[m_voiceIdx[row]], m_knobs[row]);
         }
     }
 }
@@ -454,6 +576,140 @@ void SequencerScene::drawStatus() {
                         {{.x = 112, .y = 224}}, white);
 }
 
+void SequencerScene::drawKnobPage() {
+    // Y2K cyber grey palette translated to PS1 RGB.
+    psyqo::Color white{{.r = 240, .g = 240, .b = 240}};
+    psyqo::Color cyan {{.r =  60, .g = 200, .b = 220}};
+    psyqo::Color dim  {{.r =  90, .g = 100, .b = 115}};
+    psyqo::Color rowCol = ROW_COLORS[m_cursorRow];
+
+    // Header bar.
+    psyqo::Prim::Rectangle headerBg{{{.r = 24, .g = 28, .b = 36}}};
+    headerBg.position = {{.x = 0, .y = 0}};
+    headerBg.size     = {{.x = 320, .y = 22}};
+    acidRom.gpu().sendPrimitive(headerBg);
+
+    acidRom.m_font.print(acidRom.gpu(), ROW_LABELS[m_cursorRow],
+                        {{.x = 8, .y = 6}}, rowCol);
+    acidRom.m_font.print(acidRom.gpu(), g_voices[m_voiceIdx[m_cursorRow]].name,
+                        {{.x = 56, .y = 6}}, white);
+    acidRom.m_font.print(acidRom.gpu(), "KNOBS", {{.x = 130, .y = 6}}, cyan);
+    char buf[8];
+    buf[0] = 'P'; buf[1] = 'A'; buf[2] = 'T'; buf[3] = ' ';
+    buf[4] = '1' + static_cast<char>(m_currentPattern); buf[5] = '\0';
+    acidRom.m_font.print(acidRom.gpu(), buf, {{.x = 192, .y = 6}}, white);
+    acidRom.m_font.print(acidRom.gpu(),
+        reverb::enabled() ? "REV" : "DRY",
+        {{.x = 232, .y = 6}}, reverb::enabled() ? cyan : dim);
+    acidRom.m_font.print(acidRom.gpu(),
+        m_running ? "PLAY" : "STOP", {{.x = 280, .y = 6}},
+        m_running ? cyan : dim);
+
+    // Row chooser strip on the left — 4 small color squares + arrows.
+    for (int r = 0; r < NUM_ROWS; ++r) {
+        psyqo::Prim::Rectangle sq{ROW_COLORS[r]};
+        if (r != m_cursorRow) {
+            sq.setColor({{.r = static_cast<uint8_t>(ROW_COLORS[r].r >> 2),
+                          .g = static_cast<uint8_t>(ROW_COLORS[r].g >> 2),
+                          .b = static_cast<uint8_t>(ROW_COLORS[r].b >> 2)}});
+        }
+        sq.position = {{.x = 8, .y = static_cast<int16_t>(36 + r * 40)}};
+        sq.size     = {{.x = 32, .y = 32}};
+        acidRom.gpu().sendPrimitive(sq);
+        acidRom.m_font.print(acidRom.gpu(), ROW_LABELS[r],
+                            {{.x = 10, .y = static_cast<int16_t>(46 + r * 40)}},
+                            (r == m_cursorRow) ? white : dim);
+    }
+
+    // Four vertical fader knobs.
+    const RowKnobs &k = m_knobs[m_cursorRow];
+    auto drawFader = [&](int slot, const char *label, int value, int valueMax) {
+        constexpr int FX0     = 60;
+        constexpr int FY0     = 36;
+        constexpr int F_W     = 36;
+        constexpr int F_H     = 110;
+        constexpr int F_STEP  = 56;
+        int x = FX0 + slot * F_STEP;
+        int y = FY0;
+
+        // Outline.
+        psyqo::Color box{{.r = 14, .g = 18, .b = 25}};
+        psyqo::Prim::Rectangle outer{box};
+        outer.position = {{.x = static_cast<int16_t>(x), .y = static_cast<int16_t>(y)}};
+        outer.size     = {{.x = F_W, .y = F_H}};
+        acidRom.gpu().sendPrimitive(outer);
+
+        // Cyan border when this is the selected knob.
+        if (slot == m_knobCursor) {
+            psyqo::Prim::Rectangle bTop{cyan}, bBot{cyan}, bL{cyan}, bR{cyan};
+            bTop.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y - 1)}};
+            bTop.size     = {{.x = F_W + 2, .y = 1}};
+            bBot.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y + F_H)}};
+            bBot.size     = {{.x = F_W + 2, .y = 1}};
+            bL.position   = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y)}};
+            bL.size       = {{.x = 1, .y = F_H}};
+            bR.position   = {{.x = static_cast<int16_t>(x + F_W), .y = static_cast<int16_t>(y)}};
+            bR.size       = {{.x = 1, .y = F_H}};
+            acidRom.gpu().sendPrimitive(bTop);
+            acidRom.gpu().sendPrimitive(bBot);
+            acidRom.gpu().sendPrimitive(bL);
+            acidRom.gpu().sendPrimitive(bR);
+        }
+
+        // Fill from bottom proportional to value.
+        int fillH = (F_H - 4) * value / valueMax;
+        if (fillH < 0) fillH = 0;
+        if (fillH > F_H - 4) fillH = F_H - 4;
+        psyqo::Prim::Rectangle fill{rowCol};
+        fill.position = {{.x = static_cast<int16_t>(x + 2),
+                          .y = static_cast<int16_t>(y + F_H - 2 - fillH)}};
+        fill.size     = {{.x = F_W - 4, .y = static_cast<int16_t>(fillH)}};
+        acidRom.gpu().sendPrimitive(fill);
+
+        // Tick marks (3 horizontal lines).
+        for (int t = 1; t <= 3; ++t) {
+            psyqo::Prim::Rectangle tick{dim};
+            tick.position = {{.x = static_cast<int16_t>(x + 2),
+                              .y = static_cast<int16_t>(y + (F_H * t) / 4)}};
+            tick.size     = {{.x = F_W - 4, .y = 1}};
+            acidRom.gpu().sendPrimitive(tick);
+        }
+
+        acidRom.m_font.print(acidRom.gpu(), label,
+                            {{.x = static_cast<int16_t>(x + 6),
+                              .y = static_cast<int16_t>(y + F_H + 4)}}, cyan);
+    };
+
+    drawFader(0, "LVL", k.level, 255);
+    drawFader(1, "PIT", k.pitch + 12, 24);
+    drawFader(2, "TNE", k.tone, 255);
+    drawFader(3, "DCY", k.decay, 255);
+
+    // Numeric readout under each fader.
+    auto printNum = [&](int slot, int val) {
+        char b[5];
+        if (val < 0) { b[0] = '-'; val = -val; } else b[0] = ' ';
+        b[1] = '0' + ((val / 100) % 10);
+        b[2] = '0' + ((val / 10)  % 10);
+        b[3] = '0' + ( val        % 10);
+        b[4] = '\0';
+        acidRom.m_font.print(acidRom.gpu(), b,
+                            {{.x = static_cast<int16_t>(60 + slot * 56),
+                              .y = 164}}, white);
+    };
+    printNum(0, k.level);
+    printNum(1, k.pitch);
+    printNum(2, k.tone);
+    printNum(3, k.decay);
+
+    // Help line.
+    acidRom.m_font.print(acidRom.gpu(),
+        "LR:knob UD:row X/SQ:+/- R2:back",
+        {{.x = 4, .y = 200}}, dim);
+    acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom",
+        {{.x = 112, .y = 224}}, white);
+}
+
 void SequencerScene::frame() {
     psyqo::Color bg{{.r = 8, .g = 4, .b = 16}};
     acidRom.gpu().clear(bg);
@@ -461,8 +717,12 @@ void SequencerScene::frame() {
     handleInput();
     advancePlayback();
 
-    for (int row = 0; row < NUM_ROWS; ++row) drawRow(row);
-    drawStatus();
+    if (m_knobPage) {
+        drawKnobPage();
+    } else {
+        for (int row = 0; row < NUM_ROWS; ++row) drawRow(row);
+        drawStatus();
+    }
 
     // M9: PSVJ sync stripe in the top-right corner. Four 4x4 rectangles
     // encoding the current sequencer state in their RGB triplets, so the
