@@ -36,3 +36,10 @@ foreach(voice bd sd tom hh cy cp cb tb303)
     target_link_libraries(test_${voice}_basic PRIVATE dsp)
     add_test(NAME ${voice}_basic COMMAND test_${voice}_basic)
 endforeach()
+
+# Build-time helper that pre-renders each voice and emits a generated header
+# of PSX ADPCM bytes for the PS1 build to embed and play via SPU. Run
+# manually (or via `cmake --build . --target gen_voice_samples`) after any
+# DSP coefficient change; commit the generated header to source control.
+add_executable(gen_voice_samples gen_voice_samples.cpp adpcm_psx.cpp)
+target_link_libraries(gen_voice_samples PRIVATE dsp)
