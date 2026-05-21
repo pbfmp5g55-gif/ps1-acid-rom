@@ -35,7 +35,7 @@ constexpr int NUM_ROWS  = 4;
 constexpr int NUM_STEPS = 16;
 constexpr int FRAMES_PER_STEP = 8;          // ~112 BPM @ 60 Hz NTSC
 
-constexpr int NUM_VOICES = 11;
+constexpr int NUM_VOICES = 13;
 
 struct VoiceDef {
     const char *name;        // ≤3 chars for inline label
@@ -55,8 +55,10 @@ VoiceDef g_voices[NUM_VOICES] = {
     {"CB",  acid::voice_samples::cb_adpcm,           acid::voice_samples::cb_adpcm_bytes,           0x1c00, 0},
     {"SAW", acid::voice_samples::tb303_saw_adpcm,    acid::voice_samples::tb303_saw_adpcm_bytes,    0x2800, 0},
     {"SQR", acid::voice_samples::tb303_square_adpcm, acid::voice_samples::tb303_square_adpcm_bytes, 0x2400, 0},
-    {"BD9", acid::voice_samples::r909bd_adpcm,       acid::voice_samples::r909bd_adpcm_bytes,       0x3000, 0},
-    {"SD9", acid::voice_samples::r909sd_adpcm,       acid::voice_samples::r909sd_adpcm_bytes,       0x2400, 0},
+    {"BD9", acid::voice_samples::r909bd_adpcm,         acid::voice_samples::r909bd_adpcm_bytes,         0x3000, 0},
+    {"SD9", acid::voice_samples::r909sd_adpcm,         acid::voice_samples::r909sd_adpcm_bytes,         0x2400, 0},
+    {"SW2", acid::voice_samples::tb303s2_saw_adpcm,    acid::voice_samples::tb303s2_saw_adpcm_bytes,    0x2800, 0},
+    {"SQ2", acid::voice_samples::tb303s2_square_adpcm, acid::voice_samples::tb303s2_square_adpcm_bytes, 0x2400, 0},
 };
 
 constexpr uint8_t CH_PER_ROW[NUM_ROWS] = {0, 1, 2, 3};
