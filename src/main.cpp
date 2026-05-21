@@ -112,14 +112,28 @@ class SequencerScene final : public psyqo::Scene {
     void handleInput();
     void advancePlayback();
 
-    uint16_t m_pattern[NUM_ROWS] = {
-        0b0010001000100010,  // 303 A
-        0b0000000000000000,  // 303 B
-        0b1000100010001000,  // 808 → BD: 4-on-the-floor (LSB = step 0)
-        0b0101010101010101,  // 909 → HH: off-eighths
+    // M4: up to 8 patterns in RAM. m_currentPattern is the one being edited
+    // and displayed in the grid. m_chainLength controls how many patterns
+    // cycle during playback (1 = current pattern loops; 2 = 0->1->0->1; up
+    // to 8). m_playingPattern is which pattern is currently being heard
+    // (== m_currentPattern when chainLength=1).
+    static constexpr int NUM_PATTERNS = 8;
+    uint16_t m_patterns[NUM_PATTERNS][NUM_ROWS] = {
+        // Default seed pattern at slot 0. Others empty.
+        {
+            0b0010001000100010,
+            0b0000000000000000,
+            0b1000100010001000,
+            0b0101010101010101,
+        },
     };
+    int m_currentPattern  = 0;
+    int m_playingPattern  = 0;
+    int m_chainLength     = 1;
+    int m_chainPos        = 0;
 
-    // Default voice mapping. Players can change via Triangle/Circle.
+    // Voice mapping is global across patterns (drum machine convention —
+    // sound stays put when you switch patterns).
     int m_voiceIdx[NUM_ROWS] = {7, 8, 0, 3};  // SAW, SQR, BD, HH
 
     int m_cursorRow  = 2;
@@ -182,8 +196,8 @@ void SequencerScene::handleInput() {
     if (press(B::Up))    m_cursorRow  = (m_cursorRow + NUM_ROWS - 1) % NUM_ROWS;
     if (press(B::Down))  m_cursorRow  = (m_cursorRow + 1) % NUM_ROWS;
 
-    if (press(B::Cross))  m_pattern[m_cursorRow] ^= (uint16_t(1) << m_cursorStep);
-    if (press(B::Square)) m_pattern[m_cursorRow] = 0;
+    if (press(B::Cross))  m_patterns[m_currentPattern][m_cursorRow] ^= (uint16_t(1) << m_cursorStep);
+    if (press(B::Square)) m_patterns[m_currentPattern][m_cursorRow] = 0;
     if (press(B::Start))  m_running = !m_running;
 
     // Triangle: next voice for cursor row. Circle: previous.
@@ -192,6 +206,17 @@ void SequencerScene::handleInput() {
     }
     if (press(B::Circle)) {
         m_voiceIdx[m_cursorRow] = (m_voiceIdx[m_cursorRow] + NUM_VOICES - 1) % NUM_VOICES;
+    }
+
+    // L1 / R1: cycle the pattern being edited (0..7).
+    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
+    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
+
+    // Select: cycle chain length 1..NUM_PATTERNS. At length 1 only the
+    // current pattern loops; at higher lengths patterns 0..length-1 cycle.
+    if (press(B::Select)) {
+        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
+        m_chainPos = 0;
     }
 
     uint16_t bits = 0;
@@ -207,9 +232,19 @@ void SequencerScene::advancePlayback() {
     if (!m_running) return;
     if ((m_frameCounter % FRAMES_PER_STEP) != 0) return;
 
-    m_playStep = (m_frameCounter / FRAMES_PER_STEP) % NUM_STEPS;
+    int newStep = (m_frameCounter / FRAMES_PER_STEP) % NUM_STEPS;
+    // Detect bar wraparound (step 15 → 0) and advance the chain position.
+    if (newStep == 0 && m_playStep != 0) {
+        if (m_chainLength > 1) {
+            m_chainPos = (m_chainPos + 1) % m_chainLength;
+        }
+    }
+    m_playStep = newStep;
+
+    m_playingPattern = (m_chainLength > 1) ? m_chainPos : m_currentPattern;
+
     for (int row = 0; row < NUM_ROWS; ++row) {
-        if (m_pattern[row] & (uint16_t(1) << m_playStep)) {
+        if (m_patterns[m_playingPattern][row] & (uint16_t(1) << m_playStep)) {
             triggerVoice(CH_PER_ROW[row], g_voices[m_voiceIdx[row]]);
         }
     }
@@ -243,7 +278,7 @@ void SequencerScene::drawRow(int row) {
 
     for (int step = 0; step < NUM_STEPS; ++step) {
         int x = LEDS_X0 + step * (LED_W + LED_GAP);
-        bool active   = (m_pattern[row] & (uint16_t(1) << step)) != 0;
+        bool active   = (m_patterns[m_currentPattern][row] & (uint16_t(1) << step)) != 0;
         bool playing  = m_running && (step == m_playStep);
         bool isCursor = (row == m_cursorRow && step == m_cursorStep);
 
@@ -286,14 +321,41 @@ void SequencerScene::drawRow(int row) {
 void SequencerScene::drawStatus() {
     psyqo::Color white{{.r = 255, .g = 255, .b = 255}};
     psyqo::Color dim  {{.r = 128, .g = 128, .b = 128}};
+    psyqo::Color amber{{.r = 240, .g = 180, .b = 60}};
+
     acidRom.m_font.print(acidRom.gpu(),
         m_running ? "PLAY" : "STOP", {{.x = 8, .y = 168}},
         m_running ? white : dim);
-    acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom M1",
-                        {{.x = 80, .y = 224}}, white);
+
+    // Pattern / chain readout: "PAT 1/8  CHN 4  PLAY 2"
+    // PAT = pattern being edited.  CHN = chain length.  PLAY = which
+    // pattern is currently audible (only meaningful when CHN > 1).
+    char patBuf[8];
+    patBuf[0] = 'P'; patBuf[1] = 'A'; patBuf[2] = 'T'; patBuf[3] = ' ';
+    patBuf[4] = '1' + static_cast<char>(m_currentPattern); patBuf[5] = '/';
+    patBuf[6] = '0' + static_cast<char>(NUM_PATTERNS);
+    patBuf[7] = '\0';
+    acidRom.m_font.print(acidRom.gpu(), patBuf, {{.x = 56, .y = 168}}, amber);
+
+    char chnBuf[8];
+    chnBuf[0] = 'C'; chnBuf[1] = 'H'; chnBuf[2] = 'N'; chnBuf[3] = ' ';
+    chnBuf[4] = '1' + static_cast<char>(m_chainLength - 1);
+    chnBuf[5] = '\0';
+    acidRom.m_font.print(acidRom.gpu(), chnBuf, {{.x = 128, .y = 168}}, white);
+
+    if (m_chainLength > 1) {
+        char nowBuf[8];
+        nowBuf[0] = '>'; nowBuf[1] = ' ';
+        nowBuf[2] = '1' + static_cast<char>(m_playingPattern);
+        nowBuf[3] = '\0';
+        acidRom.m_font.print(acidRom.gpu(), nowBuf, {{.x = 176, .y = 168}}, white);
+    }
+
     acidRom.m_font.print(acidRom.gpu(),
-                        "X:tgl SQ:clr ST:run TRI/O:voice",
-                        {{.x = 32, .y = 200}}, dim);
+                        "X:tgl SQ:clr TRI/O:voice L/R:pat SEL:chn",
+                        {{.x = 4, .y = 200}}, dim);
+    acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom",
+                        {{.x = 112, .y = 224}}, white);
 }
 
 void SequencerScene::frame() {
