@@ -464,6 +464,30 @@ void SequencerScene::frame() {
     for (int row = 0; row < NUM_ROWS; ++row) drawRow(row);
     drawStatus();
 
+    // M9: PSVJ sync stripe in the top-right corner. Four 4x4 rectangles
+    // encoding the current sequencer state in their RGB triplets, so the
+    // ps1-vj-mix mixer can lock VJ params (chance / chaos / texture swap)
+    // to whatever pattern is currently playing. Contract documented in
+    // design/PSVJ_INTEGRATION.md; mixer side TODO.
+    auto stripeCell = [&](int idx, uint8_t r, uint8_t g, uint8_t b) {
+        psyqo::Prim::Rectangle cell{{{.r = r, .g = g, .b = b}}};
+        cell.position = {{.x = static_cast<int16_t>(304 + idx * 4), .y = 0}};
+        cell.size     = {{.x = 4, .y = 4}};
+        acidRom.gpu().sendPrimitive(cell);
+    };
+    stripeCell(0, static_cast<uint8_t>(m_playStep),
+                  static_cast<uint8_t>(m_chainLength),
+                  0x00);
+    stripeCell(1, static_cast<uint8_t>(m_playingPattern),
+                  static_cast<uint8_t>(m_currentPattern),
+                  reverb::enabled() ? 1 : 0);
+    stripeCell(2, static_cast<uint8_t>(m_voiceIdx[0]),
+                  static_cast<uint8_t>(m_voiceIdx[1]),
+                  static_cast<uint8_t>(m_voiceIdx[2]));
+    stripeCell(3, static_cast<uint8_t>(m_voiceIdx[3]),
+                  m_running ? 0xff : 0x00,
+                  0x00);
+
     m_frameCounter++;
 }
 
