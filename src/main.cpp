@@ -1,26 +1,32 @@
 // ps1-acid-rom — PS1 sequencer (TB-303 × 2 stages + TR-808 + TR-909).
 //
-// Drum-machine workflow:
-//   - 13 voices, each with its own 16-step sequencer per pattern.
-//   - The display shows ONE voice's 16-step row at a time. Triangle / Circle
-//     (or D-pad up/down) flips to the previous / next voice. During playback
-//     all voices play simultaneously off their own steps.
-//   - 8 patterns × 13 voices = 104 sequencer slots, plus a chain-length knob
-//     (Select) for cycling 1..8 patterns.
-//   - SimplePad pad 1:
-//       D-pad ←→ : step cursor within the visible voice
-//       D-pad ↑↓ : prev / next voice (alt: Triangle / Circle)
-//       Cross   : step toggle on the visible voice
-//       Square  : clear the visible voice's pattern
-//       Start   : play / pause
-//       Select  : chain length cycle 1..8
-//       L1 / R1 : prev / next pattern slot to edit
-//       L2      : global reverb on / off
-//       L3      : reverb send on / off for the visible voice
-//       R2      : enter / leave the knob page (per-voice LVL/PIT/TNE/DCY)
+// Four synths grouped behind the four face buttons. Pressing a face button
+// jumps the whole screen to that synth so we can use the full 320×240 for
+// one machine's UI:
 //
-// Voice samples were rendered host-side by host_tests/gen_voice_samples (same
-// C++ DSP source) and embedded as PSX ADPCM in src/generated/voice_samples.h.
+//   ×  (Cross)    → TB-303 STAGE 1   (SAW, SQR)
+//   ○  (Circle)   → TB-303 STAGE 2   (SW2, SQ2)
+//   □  (Square)   → TR-808           (BD, SD, TOM, HH, CY, CP, CB)
+//   △  (Triangle) → TR-909           (BD9, SD9)
+//
+// Within the active synth:
+//   L1 / R1                 previous / next voice
+//   L2 / R2                 step OFF / ON at the cursor
+//   D-pad ←→                step cursor
+//   D-pad ↑↓                KNOB 1 ± (CUT for 303, PIT for drums)
+//   Select + L1 / R1        KNOB 2 − / + (RES for 303, DCY for drums)
+//   Select + D-pad ←→       pattern slot prev / next
+//   Start                   play / stop
+//   Select (tap, no chord)  chain length cycle
+//
+// We deliberately avoid binding to L3 / R3 — those buttons only exist on
+// DualShock (analog-stick clicks). On the original PSX digital pad they
+// simply don't physically exist, and SimplePad reports them as always-up.
+//
+// Knob change is always live — no tweak-mode flag, no separate knob page.
+// 13 voices live underneath, distributed across the 4 synths; each voice
+// keeps its own 16-step pattern per slot, so swapping voice or synth never
+// loses your work in the others.
 
 #include "psyqo/application.hh"
 #include "psyqo/font.hh"
@@ -51,14 +57,14 @@ constexpr int PITCH_TABLE_ZERO = 12;
 constexpr int NUM_VOICES   = 13;
 constexpr int NUM_PATTERNS = 8;
 constexpr int NUM_STEPS    = 16;
-constexpr int FRAMES_PER_STEP = 8;   // ~112 BPM @ 60 Hz NTSC
+constexpr int FRAMES_PER_STEP = 8;
 
 struct VoiceDef {
-    const char *name;        // ≤3 chars for inline label
+    const char *name;
     const uint8_t *data;
     unsigned bytes;
     uint16_t volume;
-    uint32_t spuAddr;        // assigned at boot
+    uint32_t spuAddr;
 };
 
 VoiceDef g_voices[NUM_VOICES] = {
@@ -77,68 +83,56 @@ VoiceDef g_voices[NUM_VOICES] = {
     {"SQ2", acid::voice_samples::tb303s2_square_adpcm, acid::voice_samples::tb303s2_square_adpcm_bytes, 0x2400, 0},
 };
 
-// SPU channel allocation: one channel per voice = voice index. PS1 SPU has 24
-// channels so all 13 voices coexist with room left.
 constexpr uint8_t CH_PER_VOICE(int v) { return static_cast<uint8_t>(v); }
 
-// Family color — used to tint LEDs / labels so 303 / 808 / 909 stay visually
-// distinct even though they share one sequencer view.
-psyqo::Color voiceColor(int v) {
-    if (v <= 6)  return {{.r = 220, .g = 180, .b =  80}};   // 808 family — cream
-    if (v <= 8)  return {{.r = 220, .g = 110, .b =  40}};   // 303 stage 1 — orange
-    if (v <= 10) return {{.r = 220, .g =  70, .b =  60}};   // 909 family — red
-    return {{.r = 200, .g = 100, .b = 220}};                // 303 stage 2 — magenta
-}
+// Synth grouping for the face-button selector.
+struct SynthDef {
+    const char *shortName;   // "303", "303+", "808", "909"
+    const char *longName;    // "TB-303 STAGE 1" etc.
+    int firstVoice;          // index into g_voices
+    int voiceCount;
+    psyqo::Color color;
+};
 
-// Per-voice mutable parameters. Stored regardless of voice family; the UI
-// only displays the subset that makes sense for the family (303 voices show
-// CUT/RES/ENV/DCY; drum voices show PIT/TNE/DCY/LVL).
-//
-// Audibly realised today via the SPU: LEVEL (channel volume) and PITCH
-// (sampleRate). Others are stored & visualised but only become audible once
-// M2-live (runtime DSP render on PS1) lands.
+constexpr int NUM_SYNTHS = 4;
+constexpr SynthDef SYNTHS[NUM_SYNTHS] = {
+    {"303",  "TB-303 STAGE 1",  7, 2, {{.r = 220, .g = 110, .b =  40}}},
+    {"303+", "TB-303 STAGE 2", 11, 2, {{.r = 200, .g = 100, .b = 220}}},
+    {"808",  "TR-808 ANALOG",   0, 7, {{.r = 220, .g = 180, .b =  80}}},
+    {"909",  "TR-909 HYBRID",   9, 2, {{.r = 220, .g =  70, .b =  60}}},
+};
+
+inline bool isAcidSynth(int s) { return s == 0 || s == 1; }
+
 struct RowKnobs {
     uint8_t level   = 0xC0;
     int8_t  pitch   = 0;
     uint8_t tone    = 0x80;
     uint8_t decay   = 0x80;
-    uint8_t cutoff  = 0x66;   // 303 only
-    uint8_t reso    = 0xB3;   // 303 only
-    uint8_t envMod  = 0x99;   // 303 only
+    uint8_t cutoff  = 0x66;
+    uint8_t reso    = 0xB3;
+    uint8_t envMod  = 0x99;
 };
 
 constexpr int NUM_KNOBS = 4;
 
-// Voice family classification.
-inline bool isAcid(int v) {
-    // SAW (7), SQR (8), SW2 (11), SQ2 (12) — all 303-derived voices.
-    return v == 7 || v == 8 || v == 11 || v == 12;
-}
-
-// Knob layout per family. Index 0..3 within the family-specific bank.
 struct KnobSlot {
     const char *label;
-    int valueMax;   // for fader fill ratio
+    int valueMax;
 };
 constexpr KnobSlot ACID_KNOBS[NUM_KNOBS] = {
-    {"CUT", 255},  // cutoff
-    {"RES", 255},  // resonance
-    {"ENV", 255},  // env mod
-    {"DCY", 255},  // decay
+    {"CUT", 255}, {"RES", 255}, {"ENV", 255}, {"DCY", 255},
 };
 constexpr KnobSlot DRUM_KNOBS[NUM_KNOBS] = {
-    {"PIT",  24},  // -12..+12 → 0..24 for fader fill
-    {"TNE", 255},  // tone
-    {"DCY", 255},  // decay
-    {"LVL", 255},  // level
+    {"PIT",  24}, {"TNE", 255}, {"DCY", 255}, {"LVL", 255},
 };
 
-inline const KnobSlot *knobSetFor(int voice) {
-    return isAcid(voice) ? ACID_KNOBS : DRUM_KNOBS;
+inline const KnobSlot *knobSetForSynth(int s) {
+    return isAcidSynth(s) ? ACID_KNOBS : DRUM_KNOBS;
 }
 
-inline int knobValue(const RowKnobs &k, int voice, int slot) {
-    if (isAcid(voice)) {
+inline int knobValue(const RowKnobs &k, int synth, int slot) {
+    if (isAcidSynth(synth)) {
         switch (slot) {
             case 0: return k.cutoff;
             case 1: return k.reso;
@@ -147,7 +141,7 @@ inline int knobValue(const RowKnobs &k, int voice, int slot) {
         }
     } else {
         switch (slot) {
-            case 0: return k.pitch + 12;  // shift to 0..24
+            case 0: return k.pitch + 12;
             case 1: return k.tone;
             case 2: return k.decay;
             case 3: return k.level;
@@ -156,33 +150,27 @@ inline int knobValue(const RowKnobs &k, int voice, int slot) {
     return 0;
 }
 
-inline void knobBump(RowKnobs &k, int voice, int slot, int delta) {
-    auto clamp8 = [](int v) {
-        if (v < 0) v = 0;
-        if (v > 255) v = 255;
-        return static_cast<uint8_t>(v);
-    };
-    if (isAcid(voice)) {
-        int step = 0x10;
+inline void knobBump(RowKnobs &k, int synth, int slot, int delta) {
+    auto clamp8 = [](int v) { if (v < 0) v = 0; if (v > 255) v = 255; return static_cast<uint8_t>(v); };
+    if (isAcidSynth(synth)) {
         switch (slot) {
-            case 0: k.cutoff = clamp8(static_cast<int>(k.cutoff) + delta * step); break;
-            case 1: k.reso   = clamp8(static_cast<int>(k.reso)   + delta * step); break;
-            case 2: k.envMod = clamp8(static_cast<int>(k.envMod) + delta * step); break;
-            case 3: k.decay  = clamp8(static_cast<int>(k.decay)  + delta * step); break;
+            case 0: k.cutoff = clamp8(static_cast<int>(k.cutoff) + delta * 0x10); break;
+            case 1: k.reso   = clamp8(static_cast<int>(k.reso)   + delta * 0x10); break;
+            case 2: k.envMod = clamp8(static_cast<int>(k.envMod) + delta * 0x10); break;
+            case 3: k.decay  = clamp8(static_cast<int>(k.decay)  + delta * 0x10); break;
         }
     } else {
-        if (slot == 0) {  // PIT: semitone step
+        if (slot == 0) {
             int v = k.pitch + delta;
             if (v < -12) v = -12;
             if (v > 12)  v = 12;
             k.pitch = static_cast<int8_t>(v);
             return;
         }
-        int step = 0x10;
         switch (slot) {
-            case 1: k.tone  = clamp8(static_cast<int>(k.tone)  + delta * step); break;
-            case 2: k.decay = clamp8(static_cast<int>(k.decay) + delta * step); break;
-            case 3: k.level = clamp8(static_cast<int>(k.level) + delta * step); break;
+            case 1: k.tone  = clamp8(static_cast<int>(k.tone)  + delta * 0x10); break;
+            case 2: k.decay = clamp8(static_cast<int>(k.decay) + delta * 0x10); break;
+            case 3: k.level = clamp8(static_cast<int>(k.level) + delta * 0x10); break;
         }
     }
 }
@@ -206,24 +194,20 @@ void triggerVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k) {
 }
 
 // ----------------------------------------------------------------------------
-// SPU reverb (M8) — Sony "Hall" preset.
-
 namespace reverb {
 
 constexpr uint32_t WORK_AREA_START_BYTES = 0x70000;
 volatile uint16_t *const REVERB_REGS = reinterpret_cast<volatile uint16_t *>(0x1F801DC0);
 
 constexpr uint16_t HALL[32] = {
-    0x007D, 0x005B,
-    0x6D80, 0x54B8,
+    0x007D, 0x005B, 0x6D80, 0x54B8,
     0x4954, 0x4504, 0x3E40, 0xC97C,
-    0x4FA0, 0x5040,
-    0x55D8, 0x5570, 0x4FA8, 0x4F60, 0x4938, 0x48F0,
+    0x4FA0, 0x5040, 0x55D8, 0x5570,
+    0x4FA8, 0x4F60, 0x4938, 0x48F0,
     0x55D0, 0x5568, 0x4ABA, 0x4990,
     0x484C, 0x48E8, 0x42D8, 0x42E8,
-    0x44A0, 0x44B0,
-    0x42E8, 0x4334, 0x42DC, 0x4328,
-    0x4000, 0x4000,
+    0x44A0, 0x44B0, 0x42E8, 0x4334,
+    0x42DC, 0x4328, 0x4000, 0x4000,
 };
 
 bool g_enabled = false;
@@ -272,18 +256,19 @@ class SequencerScene final : public psyqo::Scene {
     void start(StartReason reason) override;
     void frame() override;
 
-    void drawSequencerPage();
-    void drawKnobPage();
+    void draw();
     void handleInput();
-    void handleSequencerInput();
-    void handleKnobPageInput();
     void advancePlayback();
 
-    // Per-pattern × per-voice 16-step bitmap. Bit N of m_voicePatterns[p][v]
-    // = step N is on for voice v in pattern p.
+    int selectedVoice() const {
+        return SYNTHS[m_currentSynth].firstVoice + m_voiceInSynth[m_currentSynth];
+    }
+
     uint16_t m_voicePatterns[NUM_PATTERNS][NUM_VOICES] = {};
 
-    int m_selectedVoice  = 0;
+    int m_currentSynth         = 2;          // 808 by default — fastest reward on boot
+    int m_voiceInSynth[NUM_SYNTHS] = {0, 0, 0, 0};
+
     int m_currentPattern = 0;
     int m_playingPattern = 0;
     int m_chainLength    = 1;
@@ -293,15 +278,12 @@ class SequencerScene final : public psyqo::Scene {
     uint32_t m_frameCounter = 0;
     bool m_running = true;
 
-    bool m_knobPage = false;
-    int  m_knobCursor = 0;
     RowKnobs m_knobs[NUM_VOICES];
 
-    // Inline tweak mode (R3 toggles): when true the D-pad adjusts the
-    // selected voice's LVL (LR) and PIT (UD) instead of moving the step
-    // cursor / voice selector. The fader bars on the right of the voice
-    // panel light up to indicate the mode is active.
-    bool m_tweakMode = false;
+    // Select-modifier state. Cleared when Select is pressed, set whenever
+    // any chord with Select held fires. On Select release, if no chord
+    // fired we treat the press as a "tap" and cycle the chain length.
+    bool m_selectChordFired = false;
 
     uint16_t m_prevButtons[2] = {0, 0};
 };
@@ -341,13 +323,11 @@ void AcidRom::createScene() {
 }
 
 void SequencerScene::start(StartReason) {
-    // Seed the default pattern at slot 0 so first boot has something audible.
-    // Voice indices: 0=BD, 1=SD, 3=HH, 7=SAW, 9=BD9.
+    // Default seed pattern: a small live-ish groove.
     m_voicePatterns[0][0]  = 0b1000100010001000;  // BD 4-on-the-floor
     m_voicePatterns[0][1]  = 0b0000100000001000;  // SD on backbeat
     m_voicePatterns[0][3]  = 0b0101010101010101;  // HH off-eighths
-    m_voicePatterns[0][7]  = 0b0010001000100010;  // SAW (303A) accents
-    m_voicePatterns[0][9]  = 0b0000000000000000;  // BD9 empty (alternate kit)
+    m_voicePatterns[0][7]  = 0b0010001000100010;  // SAW (303 STG1) accents
 }
 
 void SequencerScene::handleInput() {
@@ -359,15 +339,63 @@ void SequencerScene::handleInput() {
         return now && !wasDown;
     };
 
-    if (press(B::R2)) {
-        m_knobPage = !m_knobPage;
-        m_knobCursor = 0;
+    // Face buttons → synth select. Each instantly jumps the screen to that
+    // synth's view. The voice selection inside is remembered per-synth so
+    // bouncing between machines is non-destructive.
+    if (press(B::Cross))    m_currentSynth = 0;   // ×  303 STG1
+    if (press(B::Circle))   m_currentSynth = 1;   // ○  303 STG2
+    if (press(B::Square))   m_currentSynth = 2;   // □  808
+    if (press(B::Triangle)) m_currentSynth = 3;   // △  909
+
+    const SynthDef &syn = SYNTHS[m_currentSynth];
+
+    // Select-as-modifier: clear chord flag on press, and figure out whether
+    // Select is being held this frame so other handlers can branch.
+    bool selectHeld = pad.isButtonPressed(psyqo::SimplePad::Pad1, B::Select);
+    bool selectWasHeld = (m_prevButtons[0] & (1 << B::Select)) == 0;
+    if (selectHeld && !selectWasHeld) m_selectChordFired = false;
+
+    int v = selectedVoice();
+
+    // L1 / R1: voice prev / next (default), or KNOB 2 − / + when Select held.
+    if (press(B::L1)) {
+        if (selectHeld) { knobBump(m_knobs[v], m_currentSynth, 1, -1); m_selectChordFired = true; }
+        else            { m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + syn.voiceCount - 1) % syn.voiceCount; }
+    }
+    if (press(B::R1)) {
+        if (selectHeld) { knobBump(m_knobs[v], m_currentSynth, 1, +1); m_selectChordFired = true; }
+        else            { m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + 1) % syn.voiceCount; }
     }
 
-    if (m_knobPage) handleKnobPageInput();
-    else            handleSequencerInput();
+    // Re-read v after voice change (in case L1/R1 changed it without Select).
+    v = selectedVoice();
 
+    // L2 = step OFF at cursor; R2 = step ON.
+    if (press(B::L2)) m_voicePatterns[m_currentPattern][v] &= ~(uint16_t(1) << m_cursorStep);
+    if (press(B::R2)) m_voicePatterns[m_currentPattern][v] |=  (uint16_t(1) << m_cursorStep);
+
+    // D-pad LR: step cursor (default), or pattern slot prev/next when Select held.
+    if (press(B::Left)) {
+        if (selectHeld) { m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS; m_selectChordFired = true; }
+        else            { m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS; }
+    }
+    if (press(B::Right)) {
+        if (selectHeld) { m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS; m_selectChordFired = true; }
+        else            { m_cursorStep = (m_cursorStep + 1) % NUM_STEPS; }
+    }
+    // D-pad UD → KNOB 1 ± (always; no Select chord here yet).
+    if (press(B::Up))    knobBump(m_knobs[v], m_currentSynth, 0, +1);
+    if (press(B::Down))  knobBump(m_knobs[v], m_currentSynth, 0, -1);
+
+    // Transport.
     if (press(B::Start)) m_running = !m_running;
+
+    // Chain length on Select tap (released with no chord having fired).
+    bool selectJustReleased = !selectHeld && selectWasHeld;
+    if (selectJustReleased && !m_selectChordFired) {
+        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
+        m_chainPos = 0;
+    }
 
     uint16_t bits = 0;
     for (int b = 0; b < 16; ++b) {
@@ -376,79 +404,6 @@ void SequencerScene::handleInput() {
         }
     }
     m_prevButtons[0] = bits;
-}
-
-void SequencerScene::handleSequencerInput() {
-    using B = psyqo::SimplePad::Button;
-    auto &pad = acidRom.m_input;
-    auto press = [&](B b) {
-        bool now = pad.isButtonPressed(psyqo::SimplePad::Pad1, b);
-        bool wasDown = (m_prevButtons[0] & (1 << b)) == 0;
-        return now && !wasDown;
-    };
-
-    // R3 toggles tweak mode (D-pad → inline knob adjust). LED bars on
-    // the right of the voice panel will light up the mode.
-    if (press(B::R3)) m_tweakMode = !m_tweakMode;
-
-    if (m_tweakMode) {
-        // D-pad LR adjusts knob slot 0 (CUT for 303, PIT for drums).
-        // D-pad UD adjusts knob slot 1 (RES for 303, DCY for drums).
-        RowKnobs &k = m_knobs[m_selectedVoice];
-        if (press(B::Left))  knobBump(k, m_selectedVoice, 0, -1);
-        if (press(B::Right)) knobBump(k, m_selectedVoice, 0, +1);
-        if (press(B::Up))    knobBump(k, m_selectedVoice, 1, +1);
-        if (press(B::Down))  knobBump(k, m_selectedVoice, 1, -1);
-    } else {
-        if (press(B::Left))  m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
-        if (press(B::Right)) m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
-        if (press(B::Up))    m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
-        if (press(B::Down))  m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
-    }
-
-    // Voice select stays on Triangle/Circle regardless of mode (so you can
-    // change voice while tweaking without leaving tweak mode).
-    if (press(B::Triangle)) m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
-    if (press(B::Circle))   m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
-
-    if (press(B::Cross))  m_voicePatterns[m_currentPattern][m_selectedVoice] ^= (uint16_t(1) << m_cursorStep);
-    if (press(B::Square)) m_voicePatterns[m_currentPattern][m_selectedVoice] = 0;
-
-    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
-    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
-
-    if (press(B::Select)) {
-        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
-        m_chainPos = 0;
-    }
-
-    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
-    if (press(B::L3)) reverb::setVoiceSend(m_selectedVoice, !reverb::voiceSend(m_selectedVoice));
-}
-
-void SequencerScene::handleKnobPageInput() {
-    using B = psyqo::SimplePad::Button;
-    auto &pad = acidRom.m_input;
-    auto press = [&](B b) {
-        bool now = pad.isButtonPressed(psyqo::SimplePad::Pad1, b);
-        bool wasDown = (m_prevButtons[0] & (1 << b)) == 0;
-        return now && !wasDown;
-    };
-
-    if (press(B::Left))  m_knobCursor = (m_knobCursor + NUM_KNOBS - 1) % NUM_KNOBS;
-    if (press(B::Right)) m_knobCursor = (m_knobCursor + 1) % NUM_KNOBS;
-    if (press(B::Up))    m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
-    if (press(B::Down))  m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
-    if (press(B::Triangle)) m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
-    if (press(B::Circle))   m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
-
-    if (press(B::Cross))  knobBump(m_knobs[m_selectedVoice], m_selectedVoice, m_knobCursor, +1);
-    if (press(B::Square)) knobBump(m_knobs[m_selectedVoice], m_selectedVoice, m_knobCursor, -1);
-
-    if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
-    if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
-    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
-    if (press(B::L3)) reverb::setVoiceSend(m_selectedVoice, !reverb::voiceSend(m_selectedVoice));
 }
 
 void SequencerScene::advancePlayback() {
@@ -469,145 +424,126 @@ void SequencerScene::advancePlayback() {
     }
 }
 
-void SequencerScene::drawSequencerPage() {
+void SequencerScene::draw() {
     psyqo::Color white{{.r = 240, .g = 240, .b = 240}};
     psyqo::Color cyan {{.r =  60, .g = 200, .b = 220}};
     psyqo::Color dim  {{.r =  90, .g = 100, .b = 115}};
     psyqo::Color amber{{.r = 240, .g = 180, .b =  60}};
-    psyqo::Color vcol = voiceColor(m_selectedVoice);
 
-    // Header bar.
+    const SynthDef &syn = SYNTHS[m_currentSynth];
+    psyqo::Color scol = syn.color;
+    int v = selectedVoice();
+    const RowKnobs &k = m_knobs[v];
+
+    // ============ Header ============
     psyqo::Prim::Rectangle headerBg{{{.r = 24, .g = 28, .b = 36}}};
     headerBg.position = {{.x = 0, .y = 0}};
     headerBg.size     = {{.x = 320, .y = 22}};
     acidRom.gpu().sendPrimitive(headerBg);
     acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom", {{.x = 8, .y = 6}}, cyan);
     acidRom.m_font.print(acidRom.gpu(),
-        m_running ? "PLAY" : "STOP", {{.x = 116, .y = 6}}, m_running ? cyan : dim);
+        m_running ? "PLAY" : "STOP", {{.x = 108, .y = 6}}, m_running ? cyan : dim);
     char patBuf[8];
-    patBuf[0] = 'P'; patBuf[1] = 'A'; patBuf[2] = 'T'; patBuf[3] = ' ';
-    patBuf[4] = '1' + static_cast<char>(m_currentPattern); patBuf[5] = '/';
-    patBuf[6] = '0' + static_cast<char>(NUM_PATTERNS);
-    patBuf[7] = '\0';
-    acidRom.m_font.print(acidRom.gpu(), patBuf, {{.x = 160, .y = 6}}, amber);
+    patBuf[0]='P'; patBuf[1]='A'; patBuf[2]='T'; patBuf[3]=' ';
+    patBuf[4]='1'+static_cast<char>(m_currentPattern); patBuf[5]='/';
+    patBuf[6]='0'+static_cast<char>(NUM_PATTERNS); patBuf[7]='\0';
+    acidRom.m_font.print(acidRom.gpu(), patBuf, {{.x = 152, .y = 6}}, amber);
     char chnBuf[8];
-    chnBuf[0] = 'C'; chnBuf[1] = 'H'; chnBuf[2] = 'N'; chnBuf[3] = ' ';
-    chnBuf[4] = '1' + static_cast<char>(m_chainLength - 1);
-    chnBuf[5] = '\0';
-    acidRom.m_font.print(acidRom.gpu(), chnBuf, {{.x = 216, .y = 6}}, white);
+    chnBuf[0]='C'; chnBuf[1]='H'; chnBuf[2]='N'; chnBuf[3]=' ';
+    chnBuf[4]='1'+static_cast<char>(m_chainLength-1); chnBuf[5]='\0';
+    acidRom.m_font.print(acidRom.gpu(), chnBuf, {{.x = 208, .y = 6}}, white);
     acidRom.m_font.print(acidRom.gpu(),
         reverb::enabled() ? "REV" : "DRY",
-        {{.x = 264, .y = 6}}, reverb::enabled() ? cyan : dim);
+        {{.x = 256, .y = 6}}, reverb::enabled() ? cyan : dim);
 
-    // ============ Big voice display ============
-    // Voice name shown large-ish in the center top, with family color square
-    // and reverb-send badge.
-    psyqo::Prim::Rectangle vBox{vcol};
-    vBox.position = {{.x = 16, .y = 36}};
-    vBox.size     = {{.x = 70, .y = 56}};
-    acidRom.gpu().sendPrimitive(vBox);
-    psyqo::Prim::Rectangle vBoxFrame{{{.r = 10, .g = 14, .b = 22}}};
-    vBoxFrame.position = {{.x = 18, .y = 38}};
-    vBoxFrame.size     = {{.x = 66, .y = 52}};
-    acidRom.gpu().sendPrimitive(vBoxFrame);
-    acidRom.m_font.print(acidRom.gpu(), g_voices[m_selectedVoice].name,
-                        {{.x = 30, .y = 58}}, vcol);
-    if (reverb::voiceSend(m_selectedVoice)) {
-        acidRom.m_font.print(acidRom.gpu(), "REV",
-                            {{.x = 28, .y = 74}}, reverb::enabled() ? cyan : dim);
+    // ============ Synth tabs (× ○ □ △ row) ============
+    // Four equal-width tabs across the top, each labeled with both the face
+    // glyph and the synth short name. Active tab takes the synth color.
+    constexpr int TAB_Y = 26;
+    constexpr int TAB_H = 22;
+    constexpr int TAB_W = 76;
+    constexpr int TAB_X0 = 8;
+    constexpr int TAB_GAP = 4;
+    const char *glyphs[4] = {"X", "O", "[]", "/\\"};
+    for (int s = 0; s < NUM_SYNTHS; ++s) {
+        int x = TAB_X0 + s * (TAB_W + TAB_GAP);
+        psyqo::Color tabCol = (s == m_currentSynth)
+            ? SYNTHS[s].color
+            : psyqo::Color{{.r = static_cast<uint8_t>(SYNTHS[s].color.r >> 3),
+                            .g = static_cast<uint8_t>(SYNTHS[s].color.g >> 3),
+                            .b = static_cast<uint8_t>(SYNTHS[s].color.b >> 3)}};
+        psyqo::Prim::Rectangle tab{tabCol};
+        tab.position = {{.x = static_cast<int16_t>(x), .y = TAB_Y}};
+        tab.size     = {{.x = TAB_W, .y = TAB_H}};
+        acidRom.gpu().sendPrimitive(tab);
+        psyqo::Color labelCol = (s == m_currentSynth) ? white : dim;
+        acidRom.m_font.print(acidRom.gpu(), glyphs[s],
+                            {{.x = static_cast<int16_t>(x + 4), .y = TAB_Y + 6}}, labelCol);
+        acidRom.m_font.print(acidRom.gpu(), SYNTHS[s].shortName,
+                            {{.x = static_cast<int16_t>(x + 20), .y = TAB_Y + 6}}, labelCol);
     }
 
-    // Family / sub-label.
-    const char *family =
-        (m_selectedVoice <= 6)  ? "TR-808 ANALOG" :
-        (m_selectedVoice <= 8)  ? "TB-303 STG 1"  :
-        (m_selectedVoice <= 10) ? "TR-909 HYBRID" :
-                                  "TB-303 STG 2";
-    acidRom.m_font.print(acidRom.gpu(), family, {{.x = 100, .y = 40}}, vcol);
-    acidRom.m_font.print(acidRom.gpu(), "VOICE", {{.x = 100, .y = 56}}, dim);
+    // ============ Voice display + voice picker ============
+    constexpr int VOICE_Y = 56;
+    acidRom.m_font.print(acidRom.gpu(), syn.longName,
+                        {{.x = 8, .y = VOICE_Y}}, scol);
+    acidRom.m_font.print(acidRom.gpu(), "VOICE", {{.x = 8, .y = VOICE_Y + 14}}, dim);
+    acidRom.m_font.print(acidRom.gpu(), g_voices[v].name,
+                        {{.x = 48, .y = VOICE_Y + 14}}, white);
 
-    // Inline mini-faders for the 2 most important family-tailored knobs.
-    // For 303 voices: CUTOFF + RESONANCE. For drums: PITCH + DECAY. R3 (T)
-    // toggles "tweak mode" which routes the D-pad through these instead of
-    // the step cursor; bars get a cyan border when active.
-    const KnobSlot *slots = knobSetFor(m_selectedVoice);
-    auto drawMiniFader = [&](int x, int y, const char *label,
-                             int value, int valueMax, bool active) {
-        constexpr int W = 16, H = 56;
-        psyqo::Color box{{.r = 14, .g = 18, .b = 25}};
-        psyqo::Prim::Rectangle outer{box};
-        outer.position = {{.x = static_cast<int16_t>(x), .y = static_cast<int16_t>(y)}};
-        outer.size     = {{.x = W, .y = H}};
-        acidRom.gpu().sendPrimitive(outer);
-
-        int fillH = (H - 2) * value / valueMax;
-        if (fillH < 0) fillH = 0;
-        if (fillH > H - 2) fillH = H - 2;
-        psyqo::Prim::Rectangle fill{vcol};
-        fill.position = {{.x = static_cast<int16_t>(x + 1),
-                          .y = static_cast<int16_t>(y + H - 1 - fillH)}};
-        fill.size     = {{.x = W - 2, .y = static_cast<int16_t>(fillH)}};
-        acidRom.gpu().sendPrimitive(fill);
-
-        if (active) {
-            psyqo::Prim::Rectangle bTop{cyan}, bBot{cyan}, bL{cyan}, bR{cyan};
-            bTop.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y - 1)}};
-            bTop.size     = {{.x = W + 2, .y = 1}};
-            bBot.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y + H)}};
-            bBot.size     = {{.x = W + 2, .y = 1}};
-            bL.position   = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y)}};
-            bL.size       = {{.x = 1, .y = H}};
-            bR.position   = {{.x = static_cast<int16_t>(x + W), .y = static_cast<int16_t>(y)}};
-            bR.size       = {{.x = 1, .y = H}};
-            acidRom.gpu().sendPrimitive(bTop);
-            acidRom.gpu().sendPrimitive(bBot);
+    // Voice picker chips on the right side of the voice info area.
+    constexpr int PICK_X0 = 110;
+    constexpr int PICK_Y0 = VOICE_Y + 10;
+    constexpr int PICK_W  = 28;
+    constexpr int PICK_H  = 20;
+    constexpr int PICK_GAP = 2;
+    for (int i = 0; i < syn.voiceCount; ++i) {
+        int x = PICK_X0 + i * (PICK_W + PICK_GAP);
+        int voiceIdx = syn.firstVoice + i;
+        bool isSelected = (i == m_voiceInSynth[m_currentSynth]);
+        bool hasNotes   = m_voicePatterns[m_currentPattern][voiceIdx] != 0;
+        psyqo::Color c = scol;
+        if (!isSelected && !hasNotes) { c.r >>= 2; c.g >>= 2; c.b >>= 2; }
+        else if (!isSelected)         { c.r >>= 1; c.g >>= 1; c.b >>= 1; }
+        psyqo::Prim::Rectangle box{c};
+        box.position = {{.x = static_cast<int16_t>(x), .y = PICK_Y0}};
+        box.size     = {{.x = PICK_W, .y = PICK_H}};
+        acidRom.gpu().sendPrimitive(box);
+        if (isSelected) {
+            psyqo::Prim::Rectangle bT{white}, bB{white}, bL{white}, bR{white};
+            bT.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y0 - 1}};
+            bT.size     = {{.x = PICK_W + 2, .y = 1}};
+            bB.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y0 + PICK_H}};
+            bB.size     = {{.x = PICK_W + 2, .y = 1}};
+            bL.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y0}};
+            bL.size     = {{.x = 1, .y = PICK_H}};
+            bR.position = {{.x = static_cast<int16_t>(x + PICK_W), .y = PICK_Y0}};
+            bR.size     = {{.x = 1, .y = PICK_H}};
+            acidRom.gpu().sendPrimitive(bT);
+            acidRom.gpu().sendPrimitive(bB);
             acidRom.gpu().sendPrimitive(bL);
             acidRom.gpu().sendPrimitive(bR);
         }
-
-        acidRom.m_font.print(acidRom.gpu(), label,
-                            {{.x = static_cast<int16_t>(x - 2),
-                              .y = static_cast<int16_t>(y + H + 2)}},
-                            active ? cyan : dim);
-    };
-
-    const RowKnobs &k = m_knobs[m_selectedVoice];
-    drawMiniFader(258, 36, slots[0].label,
-                  knobValue(k, m_selectedVoice, 0), slots[0].valueMax,
-                  m_tweakMode);
-    drawMiniFader(286, 36, slots[1].label,
-                  knobValue(k, m_selectedVoice, 1), slots[1].valueMax,
-                  m_tweakMode);
-
-    // Tweak mode badge under the voice info — lets the player see at a
-    // glance that the D-pad is repurposed.
-    if (m_tweakMode) {
-        acidRom.m_font.print(acidRom.gpu(), "TWEAK", {{.x = 192, .y = 56}}, cyan);
+        acidRom.m_font.print(acidRom.gpu(), g_voices[voiceIdx].name,
+                            {{.x = static_cast<int16_t>(x + 4), .y = PICK_Y0 + 6}},
+                            isSelected ? white : dim);
     }
-    // Voice index out of total.
-    char vidx[8];
-    vidx[0] = ' ';
-    vidx[1] = '1' + static_cast<char>(m_selectedVoice / 10);
-    if (m_selectedVoice >= 9) vidx[1] = '1', vidx[2] = '0' + static_cast<char>((m_selectedVoice + 1) % 10);
-    else { vidx[1] = '0' + static_cast<char>(m_selectedVoice + 1); vidx[2] = ' '; }
-    vidx[3] = '/'; vidx[4] = '1'; vidx[5] = '3'; vidx[6] = '\0';
-    acidRom.m_font.print(acidRom.gpu(), vidx, {{.x = 100, .y = 72}}, white);
 
-    // ============ Step row (16 big LEDs) ============
-    constexpr int STEP_Y    = 108;
+    // ============ Step row (16 LEDs) ============
+    constexpr int STEP_Y    = 100;
     constexpr int STEP_X0   = 16;
     constexpr int STEP_W    = 16;
     constexpr int STEP_H    = 26;
     constexpr int STEP_GAP  = 3;
 
-    uint16_t pattern = m_voicePatterns[m_currentPattern][m_selectedVoice];
+    uint16_t pattern = m_voicePatterns[m_currentPattern][v];
     for (int s = 0; s < NUM_STEPS; ++s) {
         int x = STEP_X0 + s * (STEP_W + STEP_GAP);
         bool active   = (pattern & (uint16_t(1) << s)) != 0;
         bool playing  = m_running && (s == m_playStep);
         bool isCursor = (s == m_cursorStep);
 
-        psyqo::Color c = vcol;
+        psyqo::Color c = scol;
         if (!active) { c.r >>= 3; c.g >>= 3; c.b >>= 3; }
         if (playing && active) {
             c.r = c.r > 200 ? 255 : c.r + 55;
@@ -618,19 +554,14 @@ void SequencerScene::drawSequencerPage() {
         led.position = {{.x = static_cast<int16_t>(x), .y = STEP_Y}};
         led.size     = {{.x = STEP_W, .y = STEP_H}};
         acidRom.gpu().sendPrimitive(led);
-
-        // Quarter-beat marker — small bar above every 4th LED.
         if ((s & 3) == 0) {
             psyqo::Prim::Rectangle qb{cyan};
             qb.position = {{.x = static_cast<int16_t>(x + 6), .y = STEP_Y - 5}};
             qb.size     = {{.x = 4, .y = 2}};
             acidRom.gpu().sendPrimitive(qb);
         }
-
-        // Cursor outline.
         if (isCursor) {
-            psyqo::Color w{{.r = 255, .g = 255, .b = 255}};
-            psyqo::Prim::Rectangle top{w}, bot{w}, lft{w}, rgt{w};
+            psyqo::Prim::Rectangle top{white}, bot{white}, lft{white}, rgt{white};
             top.position = {{.x = static_cast<int16_t>(x - 1), .y = STEP_Y - 1}};
             top.size     = {{.x = STEP_W + 2, .y = 1}};
             bot.position = {{.x = static_cast<int16_t>(x - 1), .y = STEP_Y + STEP_H}};
@@ -645,8 +576,7 @@ void SequencerScene::drawSequencerPage() {
             acidRom.gpu().sendPrimitive(rgt);
         }
     }
-
-    // Step number ruler.
+    // Ruler under step row.
     for (int s = 0; s < NUM_STEPS; ++s) {
         char d[3];
         if (s < 9) { d[0] = '1' + static_cast<char>(s); d[1] = '\0'; }
@@ -657,178 +587,87 @@ void SequencerScene::drawSequencerPage() {
                             ((s & 3) == 0) ? amber : dim);
     }
 
-    // ============ Voice picker strip (13 mini boxes) ============
-    constexpr int PICK_Y = 168;
-    constexpr int PICK_X0 = 8;
-    constexpr int PICK_W  = 22;
-    constexpr int PICK_H  = 18;
-    constexpr int PICK_GAP = 1;
-    for (int v = 0; v < NUM_VOICES; ++v) {
-        int x = PICK_X0 + v * (PICK_W + PICK_GAP);
-        psyqo::Color c = voiceColor(v);
-        // Light any voice that has *any* step set in the current pattern.
-        bool hasNotes = m_voicePatterns[m_currentPattern][v] != 0;
-        if (!hasNotes) { c.r >>= 2; c.g >>= 2; c.b >>= 2; }
-        psyqo::Prim::Rectangle box{c};
-        box.position = {{.x = static_cast<int16_t>(x), .y = PICK_Y}};
-        box.size     = {{.x = PICK_W, .y = PICK_H}};
-        acidRom.gpu().sendPrimitive(box);
-        // Selected voice gets a white outline.
-        if (v == m_selectedVoice) {
-            psyqo::Color w{{.r = 255, .g = 255, .b = 255}};
-            psyqo::Prim::Rectangle top{w}, bot{w}, lft{w}, rgt{w};
-            top.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y - 1}};
-            top.size     = {{.x = PICK_W + 2, .y = 1}};
-            bot.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y + PICK_H}};
-            bot.size     = {{.x = PICK_W + 2, .y = 1}};
-            lft.position = {{.x = static_cast<int16_t>(x - 1), .y = PICK_Y}};
-            lft.size     = {{.x = 1, .y = PICK_H}};
-            rgt.position = {{.x = static_cast<int16_t>(x + PICK_W), .y = PICK_Y}};
-            rgt.size     = {{.x = 1, .y = PICK_H}};
-            acidRom.gpu().sendPrimitive(top);
-            acidRom.gpu().sendPrimitive(bot);
-            acidRom.gpu().sendPrimitive(lft);
-            acidRom.gpu().sendPrimitive(rgt);
-        }
-        // Label inside.
-        acidRom.m_font.print(acidRom.gpu(), g_voices[v].name,
-                            {{.x = static_cast<int16_t>(x + 2), .y = PICK_Y + 5}},
-                            (v == m_selectedVoice) ? white : dim);
-    }
-
-    // Help footer.
-    acidRom.m_font.print(acidRom.gpu(),
-        m_tweakMode
-            ? "TWEAK: LR:knob1 UD:knob2  T:exit"
-            : "X:step  S/D:voice  L/R:pat  T:tweak",
-        {{.x = 8, .y = 200}}, dim);
-    acidRom.m_font.print(acidRom.gpu(),
-        "ENTER:play  A:rev  W:send  F:full",
-        {{.x = 8, .y = 214}}, dim);
-}
-
-void SequencerScene::drawKnobPage() {
-    psyqo::Color white{{.r = 240, .g = 240, .b = 240}};
-    psyqo::Color cyan {{.r =  60, .g = 200, .b = 220}};
-    psyqo::Color dim  {{.r =  90, .g = 100, .b = 115}};
-    psyqo::Color vcol = voiceColor(m_selectedVoice);
-
-    psyqo::Prim::Rectangle headerBg{{{.r = 24, .g = 28, .b = 36}}};
-    headerBg.position = {{.x = 0, .y = 0}};
-    headerBg.size     = {{.x = 320, .y = 22}};
-    acidRom.gpu().sendPrimitive(headerBg);
-
-    acidRom.m_font.print(acidRom.gpu(), g_voices[m_selectedVoice].name,
-                        {{.x = 8, .y = 6}}, vcol);
-    acidRom.m_font.print(acidRom.gpu(), "KNOBS", {{.x = 56, .y = 6}}, cyan);
-    char buf[8];
-    buf[0] = 'P'; buf[1] = 'A'; buf[2] = 'T'; buf[3] = ' ';
-    buf[4] = '1' + static_cast<char>(m_currentPattern); buf[5] = '\0';
-    acidRom.m_font.print(acidRom.gpu(), buf, {{.x = 132, .y = 6}}, white);
-    acidRom.m_font.print(acidRom.gpu(),
-        reverb::enabled() ? "REV" : "DRY",
-        {{.x = 168, .y = 6}}, reverb::enabled() ? cyan : dim);
-    acidRom.m_font.print(acidRom.gpu(),
-        reverb::voiceSend(m_selectedVoice) ? "SEND" : "    ",
-        {{.x = 200, .y = 6}}, reverb::enabled() ? cyan : dim);
-    acidRom.m_font.print(acidRom.gpu(),
-        m_running ? "PLAY" : "STOP", {{.x = 264, .y = 6}}, m_running ? cyan : dim);
-
-    // Voice chooser strip — same 13-voice picker as the sequencer view,
-    // along the left side stacked vertically? Actually keeping it horizontal
-    // at the bottom mirrors the main view so the user's mental model stays.
-    const RowKnobs &k = m_knobs[m_selectedVoice];
-    auto drawFader = [&](int slot, const char *label, int value, int valueMax) {
-        constexpr int FX0     = 36;
-        constexpr int FY0     = 36;
-        constexpr int F_W     = 50;
-        constexpr int F_H     = 110;
-        constexpr int F_STEP  = 64;
-        int x = FX0 + slot * F_STEP;
-        int y = FY0;
-
+    // ============ Inline knob bank ============
+    // 4 fader bars all the time. Knob slots 0 + 1 are live (D-pad UD and
+    // L3/R3 respectively); slots 2 + 3 are state-only readouts until
+    // M2-live makes them audible.
+    constexpr int KFX0  = 16;
+    constexpr int KFY   = 152;
+    constexpr int KFW   = 60;
+    constexpr int KFH   = 48;
+    constexpr int KFSTP = 76;
+    const KnobSlot *slots = knobSetForSynth(m_currentSynth);
+    for (int slot = 0; slot < NUM_KNOBS; ++slot) {
+        int x = KFX0 + slot * KFSTP;
+        bool live = (slot == 0 || slot == 1);
         psyqo::Color box{{.r = 14, .g = 18, .b = 25}};
         psyqo::Prim::Rectangle outer{box};
-        outer.position = {{.x = static_cast<int16_t>(x), .y = static_cast<int16_t>(y)}};
-        outer.size     = {{.x = F_W, .y = F_H}};
+        outer.position = {{.x = static_cast<int16_t>(x), .y = KFY}};
+        outer.size     = {{.x = KFW, .y = KFH}};
         acidRom.gpu().sendPrimitive(outer);
 
-        if (slot == m_knobCursor) {
-            psyqo::Prim::Rectangle bTop{cyan}, bBot{cyan}, bL{cyan}, bR{cyan};
-            bTop.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y - 1)}};
-            bTop.size     = {{.x = F_W + 2, .y = 1}};
-            bBot.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y + F_H)}};
-            bBot.size     = {{.x = F_W + 2, .y = 1}};
-            bL.position   = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y)}};
-            bL.size       = {{.x = 1, .y = F_H}};
-            bR.position   = {{.x = static_cast<int16_t>(x + F_W), .y = static_cast<int16_t>(y)}};
-            bR.size       = {{.x = 1, .y = F_H}};
-            acidRom.gpu().sendPrimitive(bTop);
-            acidRom.gpu().sendPrimitive(bBot);
+        int value = knobValue(k, m_currentSynth, slot);
+        int fillW = (KFW - 2) * value / slots[slot].valueMax;
+        if (fillW < 0) fillW = 0;
+        if (fillW > KFW - 2) fillW = KFW - 2;
+        psyqo::Prim::Rectangle fill{scol};
+        fill.position = {{.x = static_cast<int16_t>(x + 1), .y = static_cast<int16_t>(KFY + KFH - 14)}};
+        fill.size     = {{.x = static_cast<int16_t>(fillW), .y = 8}};
+        acidRom.gpu().sendPrimitive(fill);
+
+        // Cyan border on live slots.
+        if (live) {
+            psyqo::Prim::Rectangle bT{cyan}, bB{cyan}, bL{cyan}, bR{cyan};
+            bT.position = {{.x = static_cast<int16_t>(x - 1), .y = KFY - 1}};
+            bT.size     = {{.x = KFW + 2, .y = 1}};
+            bB.position = {{.x = static_cast<int16_t>(x - 1), .y = KFY + KFH}};
+            bB.size     = {{.x = KFW + 2, .y = 1}};
+            bL.position = {{.x = static_cast<int16_t>(x - 1), .y = KFY}};
+            bL.size     = {{.x = 1, .y = KFH}};
+            bR.position = {{.x = static_cast<int16_t>(x + KFW), .y = KFY}};
+            bR.size     = {{.x = 1, .y = KFH}};
+            acidRom.gpu().sendPrimitive(bT);
+            acidRom.gpu().sendPrimitive(bB);
             acidRom.gpu().sendPrimitive(bL);
             acidRom.gpu().sendPrimitive(bR);
         }
 
-        int fillH = (F_H - 4) * value / valueMax;
-        if (fillH < 0) fillH = 0;
-        if (fillH > F_H - 4) fillH = F_H - 4;
-        psyqo::Prim::Rectangle fill{vcol};
-        fill.position = {{.x = static_cast<int16_t>(x + 2),
-                          .y = static_cast<int16_t>(y + F_H - 2 - fillH)}};
-        fill.size     = {{.x = F_W - 4, .y = static_cast<int16_t>(fillH)}};
-        acidRom.gpu().sendPrimitive(fill);
+        acidRom.m_font.print(acidRom.gpu(), slots[slot].label,
+                            {{.x = static_cast<int16_t>(x + 4), .y = KFY + 4}},
+                            live ? cyan : dim);
 
-        for (int t = 1; t <= 3; ++t) {
-            psyqo::Prim::Rectangle tick{dim};
-            tick.position = {{.x = static_cast<int16_t>(x + 2),
-                              .y = static_cast<int16_t>(y + (F_H * t) / 4)}};
-            tick.size     = {{.x = F_W - 4, .y = 1}};
-            acidRom.gpu().sendPrimitive(tick);
-        }
-
-        acidRom.m_font.print(acidRom.gpu(), label,
-                            {{.x = static_cast<int16_t>(x + 12),
-                              .y = static_cast<int16_t>(y + F_H + 4)}}, cyan);
-    };
-
-    const KnobSlot *slots = knobSetFor(m_selectedVoice);
-    for (int slot = 0; slot < NUM_KNOBS; ++slot) {
-        drawFader(slot, slots[slot].label,
-                  knobValue(k, m_selectedVoice, slot),
-                  slots[slot].valueMax);
-    }
-
-    auto printNum = [&](int slot, int val, bool signedVal) {
+        // Numeric.
         char b[5];
-        if (signedVal && val < 0) { b[0] = '-'; val = -val; }
-        else if (signedVal)       { b[0] = '+'; }
-        else                       { b[0] = ' '; }
-        b[1] = '0' + ((val / 100) % 10);
-        b[2] = '0' + ((val / 10)  % 10);
-        b[3] = '0' + ( val        % 10);
+        int displayVal = value;
+        if (slot == 0 && !isAcidSynth(m_currentSynth)) {
+            displayVal = k.pitch;
+        }
+        if (displayVal < 0) { b[0] = '-'; displayVal = -displayVal; }
+        else                 { b[0] = ' '; }
+        b[1] = '0' + ((displayVal / 100) % 10);
+        b[2] = '0' + ((displayVal / 10)  % 10);
+        b[3] = '0' + ( displayVal        % 10);
         b[4] = '\0';
         acidRom.m_font.print(acidRom.gpu(), b,
-                            {{.x = static_cast<int16_t>(54 + slot * 64),
-                              .y = 164}}, white);
-    };
-    if (isAcid(m_selectedVoice)) {
-        printNum(0, k.cutoff, false);
-        printNum(1, k.reso,   false);
-        printNum(2, k.envMod, false);
-        printNum(3, k.decay,  false);
-    } else {
-        printNum(0, k.pitch,  true);
-        printNum(1, k.tone,   false);
-        printNum(2, k.decay,  false);
-        printNum(3, k.level,  false);
+                            {{.x = static_cast<int16_t>(x + 28), .y = KFY + 4}}, white);
+
+        // Hint key under the slot for the live ones.
+        if (slot == 0) {
+            acidRom.m_font.print(acidRom.gpu(), "UD",
+                                {{.x = static_cast<int16_t>(x + KFW - 16), .y = KFY + 4}}, dim);
+        } else if (slot == 1) {
+            acidRom.m_font.print(acidRom.gpu(), "BS+QR",
+                                {{.x = static_cast<int16_t>(x + KFW - 32), .y = KFY + 4}}, dim);
+        }
     }
 
-    // Help.
+    // ============ Footer help ============
     acidRom.m_font.print(acidRom.gpu(),
-        "LR:knob  UD:voice  X/Z:+/-  F:back",
-        {{.x = 16, .y = 200}}, dim);
-    acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom",
-        {{.x = 112, .y = 224}}, white);
+        "XOZS:synth  Q/R:voice  A/F:step OFF/ON",
+        {{.x = 4, .y = 208}}, dim);
+    acidRom.m_font.print(acidRom.gpu(),
+        "LR:cur  UD:k1  BS+QR:k2  BS+LR:pat",
+        {{.x = 4, .y = 220}}, dim);
 }
 
 void SequencerScene::frame() {
@@ -837,27 +676,25 @@ void SequencerScene::frame() {
 
     handleInput();
     advancePlayback();
+    draw();
 
-    if (m_knobPage) drawKnobPage();
-    else            drawSequencerPage();
-
-    // M9 PSVJ sync stripe (top-right corner). Encodes step / pattern /
-    // selected voice / reverb state in four 4x4 colored cells.
+    // M9 PSVJ sync stripe — keep the contract.
     auto stripeCell = [&](int idx, uint8_t r, uint8_t g, uint8_t b) {
         psyqo::Prim::Rectangle cell{{{.r = r, .g = g, .b = b}}};
         cell.position = {{.x = static_cast<int16_t>(304 + idx * 4), .y = 0}};
         cell.size     = {{.x = 4, .y = 4}};
         acidRom.gpu().sendPrimitive(cell);
     };
+    int v = selectedVoice();
     stripeCell(0, static_cast<uint8_t>(m_playStep),
                   static_cast<uint8_t>(m_chainLength),
                   0x00);
     stripeCell(1, static_cast<uint8_t>(m_playingPattern),
                   static_cast<uint8_t>(m_currentPattern),
                   reverb::enabled() ? 1 : 0);
-    stripeCell(2, static_cast<uint8_t>(m_selectedVoice),
+    stripeCell(2, static_cast<uint8_t>(v),
                   m_running ? 0xff : 0x00,
-                  0x00);
+                  static_cast<uint8_t>(m_currentSynth));
     stripeCell(3, 0x00, 0x00, 0x00);
 
     m_frameCounter++;
