@@ -24,6 +24,8 @@
 #include "psyqo/simplepad.hh"
 #include "psyqo/spu.hh"
 
+#include "common/hardware/spu.h"
+
 #include "generated/voice_samples.h"
 
 namespace {
@@ -62,6 +64,74 @@ VoiceDef g_voices[NUM_VOICES] = {
 };
 
 constexpr uint8_t CH_PER_ROW[NUM_ROWS] = {0, 1, 2, 3};
+
+// ----------------------------------------------------------------------------
+// SPU reverb (M8) — Sony "Hall" preset. Reverb work area lives in the last
+// 64 KB of SPU RAM (which is 512 KB total = 0x80000), so voices placed from
+// 0x1100 upward (≤ ~130 KB) never collide with it.
+
+namespace reverb {
+
+constexpr uint32_t WORK_AREA_START_BYTES = 0x70000;          // = 448 KB
+
+// 32 × u16 reverb config block at 0x1F801DC0..0x1F801DFE.
+volatile uint16_t *const REVERB_REGS = reinterpret_cast<volatile uint16_t *>(0x1F801DC0);
+
+// Sony Hall preset. Same values that appear in the well-known PSX SDK
+// presets and no$psx documentation. Offsets are in 8-byte SPU units.
+constexpr uint16_t HALL[32] = {
+    0x007D, 0x005B,
+    0x6D80, 0x54B8,
+    0x4954, 0x4504, 0x3E40, 0xC97C,
+    0x4FA0, 0x5040,
+    0x55D8, 0x5570, 0x4FA8, 0x4F60, 0x4938, 0x48F0,
+    0x55D0, 0x5568, 0x4ABA, 0x4990,
+    0x484C, 0x48E8, 0x42D8, 0x42E8,
+    0x44A0, 0x44B0,
+    0x42E8, 0x4334, 0x42DC, 0x4328,
+    0x4000, 0x4000,
+};
+
+// Persistent state — toggled from the input handler.
+bool g_enabled = false;
+uint32_t g_channelMask = 0;  // per-voice reverb-send mask (bit N = channel N)
+
+void setup() {
+    // Halt reverb writes during reconfiguration (bit 7 of SPU_CTRL).
+    SPU_CTRL = SPU_CTRL & ~(1u << 7);
+
+    SPU_REVERB_ADDR = static_cast<uint16_t>(WORK_AREA_START_BYTES / 8);
+
+    for (int i = 0; i < 32; ++i) REVERB_REGS[i] = HALL[i];
+
+    // Reverb master volume — start centered, dial up after toggling on.
+    SPU_REVERB_LEFT  = 0x3000;
+    SPU_REVERB_RIGHT = 0x3000;
+
+    SPU_REVERB_EN_LOW  = 0;
+    SPU_REVERB_EN_HIGH = 0;
+
+    // Re-enable reverb processor; main SPU enable stays untouched.
+    SPU_CTRL = SPU_CTRL | (1u << 7);
+}
+
+void apply() {
+    SPU_REVERB_EN_LOW  = g_enabled ? static_cast<uint16_t>( g_channelMask        & 0xFFFFu) : 0;
+    SPU_REVERB_EN_HIGH = g_enabled ? static_cast<uint16_t>((g_channelMask >> 16) & 0xFFFFu) : 0;
+}
+
+void setRowSend(int row, bool on) {
+    uint32_t bit = 1u << CH_PER_ROW[row];
+    if (on) g_channelMask |=  bit;
+    else    g_channelMask &= ~bit;
+    apply();
+}
+
+void setEnabled(bool on) { g_enabled = on; apply(); }
+bool enabled() { return g_enabled; }
+bool rowSend(int row) { return (g_channelMask >> CH_PER_ROW[row]) & 1u; }
+
+}  // namespace reverb
 
 // Layout constants (320 x 240, NTSC). LED row spans x = LEDS_X0 .. LEDS_END.
 constexpr int ROW_HEIGHT = 32;
@@ -169,6 +239,8 @@ void AcidRom::prepare() {
         uploadVoice(v.spuAddr, v.data, v.bytes);
         cursor += v.bytes;
     }
+
+    reverb::setup();
 }
 
 void AcidRom::createScene() {
@@ -219,6 +291,11 @@ void SequencerScene::handleInput() {
         m_chainPos = 0;
     }
 
+    // L2: toggle global reverb on/off.
+    if (press(B::L2)) reverb::setEnabled(!reverb::enabled());
+    // L3: toggle reverb send for the cursor row.
+    if (press(B::L3)) reverb::setRowSend(m_cursorRow, !reverb::rowSend(m_cursorRow));
+
     uint16_t bits = 0;
     for (int b = 0; b < 16; ++b) {
         if (!pad.isButtonPressed(psyqo::SimplePad::Pad1, static_cast<B>(b))) {
@@ -268,6 +345,17 @@ void SequencerScene::drawRow(int row) {
     acidRom.m_font.print(acidRom.gpu(), g_voices[m_voiceIdx[row]].name,
                         {{.x = 8, .y = static_cast<int16_t>(y + 18)}},
                         voiceCol);
+
+    // Reverb send indicator — small "R" badge after voice name when this
+    // row is being sent to the SPU reverb.
+    if (reverb::rowSend(row)) {
+        psyqo::Color rCol = reverb::enabled()
+            ? psyqo::Color{{.r = 120, .g = 200, .b = 255}}
+            : psyqo::Color{{.r = 80,  .g = 80,  .b = 80}};
+        acidRom.m_font.print(acidRom.gpu(), "R",
+                            {{.x = 40, .y = static_cast<int16_t>(y + 18)}},
+                            rCol);
+    }
 
     if (row == m_cursorRow) {
         psyqo::Prim::Rectangle bar{{{.r = 240, .g = 240, .b = 240}}};
@@ -351,8 +439,16 @@ void SequencerScene::drawStatus() {
         acidRom.m_font.print(acidRom.gpu(), nowBuf, {{.x = 176, .y = 168}}, white);
     }
 
+    // Reverb state.
+    psyqo::Color revCol = reverb::enabled()
+        ? psyqo::Color{{.r = 120, .g = 200, .b = 255}}
+        : dim;
     acidRom.m_font.print(acidRom.gpu(),
-                        "X:tgl SQ:clr TRI/O:voice L/R:pat SEL:chn",
+        reverb::enabled() ? "REV ON" : "REV OFF",
+        {{.x = 232, .y = 168}}, revCol);
+
+    acidRom.m_font.print(acidRom.gpu(),
+                        "X:tgl TRI/O:voice L/R:pat SEL:chn L2:rev L3:send",
                         {{.x = 4, .y = 200}}, dim);
     acidRom.m_font.print(acidRom.gpu(), "ps1-acid-rom",
                         {{.x = 112, .y = 224}}, white);
