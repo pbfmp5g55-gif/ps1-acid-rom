@@ -90,15 +90,102 @@ psyqo::Color voiceColor(int v) {
     return {{.r = 200, .g = 100, .b = 220}};                // 303 stage 2 — magenta
 }
 
+// Per-voice mutable parameters. Stored regardless of voice family; the UI
+// only displays the subset that makes sense for the family (303 voices show
+// CUT/RES/ENV/DCY; drum voices show PIT/TNE/DCY/LVL).
+//
+// Audibly realised today via the SPU: LEVEL (channel volume) and PITCH
+// (sampleRate). Others are stored & visualised but only become audible once
+// M2-live (runtime DSP render on PS1) lands.
 struct RowKnobs {
-    uint8_t level = 0xC0;
-    int8_t  pitch = 0;
-    uint8_t tone  = 0x80;
-    uint8_t decay = 0x80;
+    uint8_t level   = 0xC0;
+    int8_t  pitch   = 0;
+    uint8_t tone    = 0x80;
+    uint8_t decay   = 0x80;
+    uint8_t cutoff  = 0x66;   // 303 only
+    uint8_t reso    = 0xB3;   // 303 only
+    uint8_t envMod  = 0x99;   // 303 only
 };
 
 constexpr int NUM_KNOBS = 4;
-constexpr const char *KNOB_LABELS[NUM_KNOBS] = {"LVL", "PIT", "TNE", "DCY"};
+
+// Voice family classification.
+inline bool isAcid(int v) {
+    // SAW (7), SQR (8), SW2 (11), SQ2 (12) — all 303-derived voices.
+    return v == 7 || v == 8 || v == 11 || v == 12;
+}
+
+// Knob layout per family. Index 0..3 within the family-specific bank.
+struct KnobSlot {
+    const char *label;
+    int valueMax;   // for fader fill ratio
+};
+constexpr KnobSlot ACID_KNOBS[NUM_KNOBS] = {
+    {"CUT", 255},  // cutoff
+    {"RES", 255},  // resonance
+    {"ENV", 255},  // env mod
+    {"DCY", 255},  // decay
+};
+constexpr KnobSlot DRUM_KNOBS[NUM_KNOBS] = {
+    {"PIT",  24},  // -12..+12 → 0..24 for fader fill
+    {"TNE", 255},  // tone
+    {"DCY", 255},  // decay
+    {"LVL", 255},  // level
+};
+
+inline const KnobSlot *knobSetFor(int voice) {
+    return isAcid(voice) ? ACID_KNOBS : DRUM_KNOBS;
+}
+
+inline int knobValue(const RowKnobs &k, int voice, int slot) {
+    if (isAcid(voice)) {
+        switch (slot) {
+            case 0: return k.cutoff;
+            case 1: return k.reso;
+            case 2: return k.envMod;
+            case 3: return k.decay;
+        }
+    } else {
+        switch (slot) {
+            case 0: return k.pitch + 12;  // shift to 0..24
+            case 1: return k.tone;
+            case 2: return k.decay;
+            case 3: return k.level;
+        }
+    }
+    return 0;
+}
+
+inline void knobBump(RowKnobs &k, int voice, int slot, int delta) {
+    auto clamp8 = [](int v) {
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        return static_cast<uint8_t>(v);
+    };
+    if (isAcid(voice)) {
+        int step = 0x10;
+        switch (slot) {
+            case 0: k.cutoff = clamp8(static_cast<int>(k.cutoff) + delta * step); break;
+            case 1: k.reso   = clamp8(static_cast<int>(k.reso)   + delta * step); break;
+            case 2: k.envMod = clamp8(static_cast<int>(k.envMod) + delta * step); break;
+            case 3: k.decay  = clamp8(static_cast<int>(k.decay)  + delta * step); break;
+        }
+    } else {
+        if (slot == 0) {  // PIT: semitone step
+            int v = k.pitch + delta;
+            if (v < -12) v = -12;
+            if (v > 12)  v = 12;
+            k.pitch = static_cast<int8_t>(v);
+            return;
+        }
+        int step = 0x10;
+        switch (slot) {
+            case 1: k.tone  = clamp8(static_cast<int>(k.tone)  + delta * step); break;
+            case 2: k.decay = clamp8(static_cast<int>(k.decay) + delta * step); break;
+            case 3: k.level = clamp8(static_cast<int>(k.level) + delta * step); break;
+        }
+    }
+}
 
 void uploadVoice(uint32_t spuAddr, const uint8_t *data, unsigned bytes) {
     psyqo::SPU::dmaWrite(spuAddr, data, static_cast<uint16_t>(bytes), 16);
@@ -210,6 +297,12 @@ class SequencerScene final : public psyqo::Scene {
     int  m_knobCursor = 0;
     RowKnobs m_knobs[NUM_VOICES];
 
+    // Inline tweak mode (R3 toggles): when true the D-pad adjusts the
+    // selected voice's LVL (LR) and PIT (UD) instead of moving the step
+    // cursor / voice selector. The fader bars on the right of the voice
+    // panel light up to indicate the mode is active.
+    bool m_tweakMode = false;
+
     uint16_t m_prevButtons[2] = {0, 0};
 };
 
@@ -294,12 +387,27 @@ void SequencerScene::handleSequencerInput() {
         return now && !wasDown;
     };
 
-    if (press(B::Left))  m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
-    if (press(B::Right)) m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
-    // Up / Down = previous / next voice (in addition to Triangle / Circle so
-    // either side of the pad can do it).
-    if (press(B::Up))    m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
-    if (press(B::Down))  m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
+    // R3 toggles tweak mode (D-pad → inline knob adjust). LED bars on
+    // the right of the voice panel will light up the mode.
+    if (press(B::R3)) m_tweakMode = !m_tweakMode;
+
+    if (m_tweakMode) {
+        // D-pad LR adjusts knob slot 0 (CUT for 303, PIT for drums).
+        // D-pad UD adjusts knob slot 1 (RES for 303, DCY for drums).
+        RowKnobs &k = m_knobs[m_selectedVoice];
+        if (press(B::Left))  knobBump(k, m_selectedVoice, 0, -1);
+        if (press(B::Right)) knobBump(k, m_selectedVoice, 0, +1);
+        if (press(B::Up))    knobBump(k, m_selectedVoice, 1, +1);
+        if (press(B::Down))  knobBump(k, m_selectedVoice, 1, -1);
+    } else {
+        if (press(B::Left))  m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
+        if (press(B::Right)) m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
+        if (press(B::Up))    m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
+        if (press(B::Down))  m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
+    }
+
+    // Voice select stays on Triangle/Circle regardless of mode (so you can
+    // change voice while tweaking without leaving tweak mode).
     if (press(B::Triangle)) m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
     if (press(B::Circle))   m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
 
@@ -334,17 +442,8 @@ void SequencerScene::handleKnobPageInput() {
     if (press(B::Triangle)) m_selectedVoice = (m_selectedVoice + 1) % NUM_VOICES;
     if (press(B::Circle))   m_selectedVoice = (m_selectedVoice + NUM_VOICES - 1) % NUM_VOICES;
 
-    auto bump = [&](int delta) {
-        RowKnobs &k = m_knobs[m_selectedVoice];
-        switch (m_knobCursor) {
-            case 0: { int v = static_cast<int>(k.level) + delta * 0x10; if (v < 0) v = 0; if (v > 255) v = 255; k.level = static_cast<uint8_t>(v); break; }
-            case 1: { int v = k.pitch + delta; if (v < -12) v = -12; if (v > 12) v = 12; k.pitch = static_cast<int8_t>(v); break; }
-            case 2: { int v = static_cast<int>(k.tone) + delta * 0x10; if (v < 0) v = 0; if (v > 255) v = 255; k.tone = static_cast<uint8_t>(v); break; }
-            case 3: { int v = static_cast<int>(k.decay) + delta * 0x10; if (v < 0) v = 0; if (v > 255) v = 255; k.decay = static_cast<uint8_t>(v); break; }
-        }
-    };
-    if (press(B::Cross))  bump(+1);
-    if (press(B::Square)) bump(-1);
+    if (press(B::Cross))  knobBump(m_knobs[m_selectedVoice], m_selectedVoice, m_knobCursor, +1);
+    if (press(B::Square)) knobBump(m_knobs[m_selectedVoice], m_selectedVoice, m_knobCursor, -1);
 
     if (press(B::L1)) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
     if (press(B::R1)) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
@@ -426,6 +525,65 @@ void SequencerScene::drawSequencerPage() {
                                   "TB-303 STG 2";
     acidRom.m_font.print(acidRom.gpu(), family, {{.x = 100, .y = 40}}, vcol);
     acidRom.m_font.print(acidRom.gpu(), "VOICE", {{.x = 100, .y = 56}}, dim);
+
+    // Inline mini-faders for the 2 most important family-tailored knobs.
+    // For 303 voices: CUTOFF + RESONANCE. For drums: PITCH + DECAY. R3 (T)
+    // toggles "tweak mode" which routes the D-pad through these instead of
+    // the step cursor; bars get a cyan border when active.
+    const KnobSlot *slots = knobSetFor(m_selectedVoice);
+    auto drawMiniFader = [&](int x, int y, const char *label,
+                             int value, int valueMax, bool active) {
+        constexpr int W = 16, H = 56;
+        psyqo::Color box{{.r = 14, .g = 18, .b = 25}};
+        psyqo::Prim::Rectangle outer{box};
+        outer.position = {{.x = static_cast<int16_t>(x), .y = static_cast<int16_t>(y)}};
+        outer.size     = {{.x = W, .y = H}};
+        acidRom.gpu().sendPrimitive(outer);
+
+        int fillH = (H - 2) * value / valueMax;
+        if (fillH < 0) fillH = 0;
+        if (fillH > H - 2) fillH = H - 2;
+        psyqo::Prim::Rectangle fill{vcol};
+        fill.position = {{.x = static_cast<int16_t>(x + 1),
+                          .y = static_cast<int16_t>(y + H - 1 - fillH)}};
+        fill.size     = {{.x = W - 2, .y = static_cast<int16_t>(fillH)}};
+        acidRom.gpu().sendPrimitive(fill);
+
+        if (active) {
+            psyqo::Prim::Rectangle bTop{cyan}, bBot{cyan}, bL{cyan}, bR{cyan};
+            bTop.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y - 1)}};
+            bTop.size     = {{.x = W + 2, .y = 1}};
+            bBot.position = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y + H)}};
+            bBot.size     = {{.x = W + 2, .y = 1}};
+            bL.position   = {{.x = static_cast<int16_t>(x - 1), .y = static_cast<int16_t>(y)}};
+            bL.size       = {{.x = 1, .y = H}};
+            bR.position   = {{.x = static_cast<int16_t>(x + W), .y = static_cast<int16_t>(y)}};
+            bR.size       = {{.x = 1, .y = H}};
+            acidRom.gpu().sendPrimitive(bTop);
+            acidRom.gpu().sendPrimitive(bBot);
+            acidRom.gpu().sendPrimitive(bL);
+            acidRom.gpu().sendPrimitive(bR);
+        }
+
+        acidRom.m_font.print(acidRom.gpu(), label,
+                            {{.x = static_cast<int16_t>(x - 2),
+                              .y = static_cast<int16_t>(y + H + 2)}},
+                            active ? cyan : dim);
+    };
+
+    const RowKnobs &k = m_knobs[m_selectedVoice];
+    drawMiniFader(258, 36, slots[0].label,
+                  knobValue(k, m_selectedVoice, 0), slots[0].valueMax,
+                  m_tweakMode);
+    drawMiniFader(286, 36, slots[1].label,
+                  knobValue(k, m_selectedVoice, 1), slots[1].valueMax,
+                  m_tweakMode);
+
+    // Tweak mode badge under the voice info — lets the player see at a
+    // glance that the D-pad is repurposed.
+    if (m_tweakMode) {
+        acidRom.m_font.print(acidRom.gpu(), "TWEAK", {{.x = 192, .y = 56}}, cyan);
+    }
     // Voice index out of total.
     char vidx[8];
     vidx[0] = ' ';
@@ -540,11 +698,13 @@ void SequencerScene::drawSequencerPage() {
 
     // Help footer.
     acidRom.m_font.print(acidRom.gpu(),
-        "X:step  S/D:voice  L/R:pat  F:knob",
-        {{.x = 16, .y = 200}}, dim);
+        m_tweakMode
+            ? "TWEAK: LR:knob1 UD:knob2  T:exit"
+            : "X:step  S/D:voice  L/R:pat  T:tweak",
+        {{.x = 8, .y = 200}}, dim);
     acidRom.m_font.print(acidRom.gpu(),
-        "ENTER:play  A:rev  W:send  BS:chain",
-        {{.x = 16, .y = 214}}, dim);
+        "ENTER:play  A:rev  W:send  F:full",
+        {{.x = 8, .y = 214}}, dim);
 }
 
 void SequencerScene::drawKnobPage() {
@@ -631,14 +791,18 @@ void SequencerScene::drawKnobPage() {
                               .y = static_cast<int16_t>(y + F_H + 4)}}, cyan);
     };
 
-    drawFader(0, "LVL", k.level, 255);
-    drawFader(1, "PIT", k.pitch + 12, 24);
-    drawFader(2, "TNE", k.tone, 255);
-    drawFader(3, "DCY", k.decay, 255);
+    const KnobSlot *slots = knobSetFor(m_selectedVoice);
+    for (int slot = 0; slot < NUM_KNOBS; ++slot) {
+        drawFader(slot, slots[slot].label,
+                  knobValue(k, m_selectedVoice, slot),
+                  slots[slot].valueMax);
+    }
 
-    auto printNum = [&](int slot, int val) {
+    auto printNum = [&](int slot, int val, bool signedVal) {
         char b[5];
-        if (val < 0) { b[0] = '-'; val = -val; } else b[0] = ' ';
+        if (signedVal && val < 0) { b[0] = '-'; val = -val; }
+        else if (signedVal)       { b[0] = '+'; }
+        else                       { b[0] = ' '; }
         b[1] = '0' + ((val / 100) % 10);
         b[2] = '0' + ((val / 10)  % 10);
         b[3] = '0' + ( val        % 10);
@@ -647,10 +811,17 @@ void SequencerScene::drawKnobPage() {
                             {{.x = static_cast<int16_t>(54 + slot * 64),
                               .y = 164}}, white);
     };
-    printNum(0, k.level);
-    printNum(1, k.pitch);
-    printNum(2, k.tone);
-    printNum(3, k.decay);
+    if (isAcid(m_selectedVoice)) {
+        printNum(0, k.cutoff, false);
+        printNum(1, k.reso,   false);
+        printNum(2, k.envMod, false);
+        printNum(3, k.decay,  false);
+    } else {
+        printNum(0, k.pitch,  true);
+        printNum(1, k.tone,   false);
+        printNum(2, k.decay,  false);
+        printNum(3, k.level,  false);
+    }
 
     // Help.
     acidRom.m_font.print(acidRom.gpu(),
