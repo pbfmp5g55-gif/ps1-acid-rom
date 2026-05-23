@@ -21,15 +21,10 @@ namespace acid::audio::stream {
 constexpr int SAMPLES_PER_BLOCK = 28;
 constexpr int BYTES_PER_BLOCK   = 16;
 
-// One buffer ≈ one NTSC video frame (16.7 ms). Sized so CPU refilling the
-// whole buffer per frame matches SPU consumption per frame — keeps the
-// CPU and SPU from stepping on each other's toes inside the buffer. The
-// previous 64-block (40 ms) buffer caused beat-frequency cancellation
-// between CPU writes and SPU reads (= "uppsura" faint hum).
-//
-// 26 blocks × 28 samples = 728 samples = 16.5 ms at 44100 Hz, which is
-// essentially one NTSC frame.
-constexpr int BLOCKS_PER_BUFFER = 26;
+// Revert to 64 blocks (40 ms). 26-block (1-frame) sizing caused total
+// silence — likely the SPU couldn't latch a LOOP_END+LOOP_ON before the
+// CPU's next refill overran the same block.
+constexpr int BLOCKS_PER_BUFFER = 64;
 constexpr int BYTES_PER_BUFFER  = BLOCKS_PER_BUFFER * BYTES_PER_BLOCK;  // 1024
 constexpr int SAMPLES_PER_BUFFER = BLOCKS_PER_BUFFER * SAMPLES_PER_BLOCK;
 
