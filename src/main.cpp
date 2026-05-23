@@ -9,15 +9,23 @@
 //   □  (Square)   → TR-808           (BD, SD, TOM, HH, CY, CP, CB)
 //   △  (Triangle) → TR-909           (BD9, SD9)
 //
-// Within the active synth:
+// Within the active synth (drum machines):
 //   L1 / R1                 previous / next voice
 //   L2 / R2                 step OFF / ON at the cursor
 //   D-pad ←→                step cursor
-//   D-pad ↑↓                KNOB 1 ± (CUT for 303, PIT for drums)
-//   Select + L1 / R1        KNOB 2 − / + (RES for 303, DCY for drums)
+//   D-pad ↑↓                KNOB 1 ± (PIT for drums)
+//   Select + L1 / R1        KNOB 2 − / +
 //   Select + D-pad ←→       pattern slot prev / next
 //   Start                   play / stop
 //   Select (tap, no chord)  chain length cycle
+//
+// On TB-303 synths the same buttons gain per-step note entry, faithful to
+// the original sequencer model:
+//   D-pad ↑↓                cursor step note ± 1 semitone
+//   Select + D-pad ↑↓       KNOB 1 ± (CUT)  -- voice-wide
+//   Select + L2             accent toggle on cursor step
+//   Select + R2             slide  toggle on cursor step
+//   Select + △ (Triangle)   randomize current pattern (notes/acc/slide/active)
 //
 // We deliberately avoid binding to L3 / R3 — those buttons only exist on
 // DualShock (analog-stick clicks). On the original PSX digital pad they
@@ -54,10 +62,47 @@ constexpr uint16_t PITCH_TABLE[25] = {
 };
 constexpr int PITCH_TABLE_ZERO = 12;
 
+// Wider 3-octave table for TB-303 per-step note entry: indices 0..36 cover
+// -12..+24 semitones. Each octave is exactly 2x the previous one's rate.
+constexpr uint16_t PITCH_TABLE_ACID[37] = {
+    0x0400, 0x043D, 0x047D, 0x04C2, 0x050A, 0x0557, 0x05A8, 0x05FE,
+    0x065A, 0x06BA, 0x0721, 0x078D,
+    0x0800,
+    0x087A, 0x08FB, 0x0983, 0x0A14, 0x0AAD, 0x0B50, 0x0BFC,
+    0x0CB3, 0x0D74, 0x0E41, 0x0F1A, 0x1000,
+    0x10F4, 0x11F6, 0x1306, 0x1428, 0x155A, 0x16A0, 0x17F8,
+    0x1966, 0x1AE8, 0x1C82, 0x1E34, 0x2000,
+};
+constexpr int PITCH_TABLE_ACID_ZERO = 12;
+constexpr int PITCH_TABLE_ACID_MAX  = 36;
+
 constexpr int NUM_VOICES   = 13;
 constexpr int NUM_PATTERNS = 8;
 constexpr int NUM_STEPS    = 16;
 constexpr int FRAMES_PER_STEP = 8;
+
+constexpr int NUM_ACID_VOICES = 4;  // 303 STG1 saw+sqr (idx 7,8) + STG2 saw+sqr (idx 11,12)
+
+inline int acidSlotForVoice(int v) {
+    switch (v) {
+        case 7:  return 0;
+        case 8:  return 1;
+        case 11: return 2;
+        case 12: return 3;
+    }
+    return -1;
+}
+inline bool isAcidVoice(int v) { return acidSlotForVoice(v) >= 0; }
+
+// Per-step metadata for 303 voices. The "active" bit still lives in the
+// shared m_voicePatterns bitfield; this struct only adds 303-specific
+// expression that drum voices don't need.
+struct AcidStep {
+    int8_t  note  = 0;   // semitones; clamped to [-12, +24]
+    uint8_t flags = 0;   // bit0 = accent, bit1 = slide
+};
+constexpr uint8_t ACID_ACCENT = 1u << 0;
+constexpr uint8_t ACID_SLIDE  = 1u << 1;
 
 struct VoiceDef {
     const char *name;
@@ -193,6 +238,25 @@ void triggerVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k) {
     psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(v.spuAddr), cfg, true);
 }
 
+void triggerAcidVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k,
+                      const AcidStep &step) {
+    psyqo::SPU::ChannelPlaybackConfig cfg{};
+    int idx = PITCH_TABLE_ACID_ZERO + static_cast<int>(step.note);
+    if (idx < 0) idx = 0;
+    if (idx > PITCH_TABLE_ACID_MAX) idx = PITCH_TABLE_ACID_MAX;
+    cfg.sampleRate.value = PITCH_TABLE_ACID[idx];
+
+    uint32_t vol = (static_cast<uint32_t>(v.volume) * k.level) / 255;
+    if (step.flags & ACID_ACCENT) {
+        vol = (vol * 13) / 10;  // +30% on accent
+    }
+    if (vol > 0x7FFF) vol = 0x7FFF;
+    cfg.volumeLeft  = static_cast<uint16_t>(vol);
+    cfg.volumeRight = static_cast<uint16_t>(vol);
+    cfg.adsr = HOLD_ADSR;
+    psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(v.spuAddr), cfg, true);
+}
+
 // ----------------------------------------------------------------------------
 namespace reverb {
 
@@ -259,12 +323,14 @@ class SequencerScene final : public psyqo::Scene {
     void draw();
     void handleInput();
     void advancePlayback();
+    void randomizeAcidPattern(int acidSlot, int voiceIdx);
 
     int selectedVoice() const {
         return SYNTHS[m_currentSynth].firstVoice + m_voiceInSynth[m_currentSynth];
     }
 
     uint16_t m_voicePatterns[NUM_PATTERNS][NUM_VOICES] = {};
+    AcidStep m_acidExtras[NUM_PATTERNS][NUM_ACID_VOICES][NUM_STEPS] = {};
 
     int m_currentSynth         = 2;          // 808 by default — fastest reward on boot
     int m_voiceInSynth[NUM_SYNTHS] = {0, 0, 0, 0};
@@ -286,6 +352,14 @@ class SequencerScene final : public psyqo::Scene {
     bool m_selectChordFired = false;
 
     uint16_t m_prevButtons[2] = {0, 0};
+
+    // LCG state for randomize; re-seeded with frame counter on each press
+    // so consecutive randomizes diverge.
+    uint32_t m_randState = 0xDEADBEEFu;
+    uint32_t lcg() {
+        m_randState = m_randState * 1664525u + 1013904223u;
+        return m_randState;
+    }
 };
 
 AcidRom acidRom;
@@ -339,21 +413,32 @@ void SequencerScene::handleInput() {
         return now && !wasDown;
     };
 
-    // Face buttons → synth select. Each instantly jumps the screen to that
-    // synth's view. The voice selection inside is remembered per-synth so
-    // bouncing between machines is non-destructive.
-    if (press(B::Cross))    m_currentSynth = 0;   // ×  303 STG1
-    if (press(B::Circle))   m_currentSynth = 1;   // ○  303 STG2
-    if (press(B::Square))   m_currentSynth = 2;   // □  808
-    if (press(B::Triangle)) m_currentSynth = 3;   // △  909
-
-    const SynthDef &syn = SYNTHS[m_currentSynth];
-
     // Select-as-modifier: clear chord flag on press, and figure out whether
-    // Select is being held this frame so other handlers can branch.
+    // Select is being held this frame so other handlers can branch. Done
+    // before face-button dispatch so synth jumps can be inhibited by chord.
     bool selectHeld = pad.isButtonPressed(psyqo::SimplePad::Pad1, B::Select);
     bool selectWasHeld = (m_prevButtons[0] & (1 << B::Select)) == 0;
     if (selectHeld && !selectWasHeld) m_selectChordFired = false;
+
+    // Face buttons → synth select. Each instantly jumps the screen to that
+    // synth's view. The voice selection inside is remembered per-synth so
+    // bouncing between machines is non-destructive. Select+Triangle is
+    // captured as the acid-randomize chord and does NOT jump to 909.
+    if (press(B::Cross))    m_currentSynth = 0;   // ×  303 STG1
+    if (press(B::Circle))   m_currentSynth = 1;   // ○  303 STG2
+    if (press(B::Square))   m_currentSynth = 2;   // □  808
+    if (press(B::Triangle)) {
+        int v0 = selectedVoice();
+        int slot0 = acidSlotForVoice(v0);
+        if (selectHeld && slot0 >= 0) {
+            randomizeAcidPattern(slot0, v0);
+            m_selectChordFired = true;
+        } else {
+            m_currentSynth = 3;
+        }
+    }
+
+    const SynthDef &syn = SYNTHS[m_currentSynth];
 
     int v = selectedVoice();
 
@@ -369,10 +454,27 @@ void SequencerScene::handleInput() {
 
     // Re-read v after voice change (in case L1/R1 changed it without Select).
     v = selectedVoice();
+    int acidSlot = acidSlotForVoice(v);
+    bool isAcid = acidSlot >= 0;
 
-    // L2 = step OFF at cursor; R2 = step ON.
-    if (press(B::L2)) m_voicePatterns[m_currentPattern][v] &= ~(uint16_t(1) << m_cursorStep);
-    if (press(B::R2)) m_voicePatterns[m_currentPattern][v] |=  (uint16_t(1) << m_cursorStep);
+    // L2 / R2: step OFF / ON at cursor by default. On 303 voices, Select
+    // turns L2/R2 into per-step accent / slide toggles.
+    if (press(B::L2)) {
+        if (selectHeld && isAcid) {
+            m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_ACCENT;
+            m_selectChordFired = true;
+        } else {
+            m_voicePatterns[m_currentPattern][v] &= ~(uint16_t(1) << m_cursorStep);
+        }
+    }
+    if (press(B::R2)) {
+        if (selectHeld && isAcid) {
+            m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_SLIDE;
+            m_selectChordFired = true;
+        } else {
+            m_voicePatterns[m_currentPattern][v] |= (uint16_t(1) << m_cursorStep);
+        }
+    }
 
     // D-pad LR: step cursor (default), or pattern slot prev/next when Select held.
     if (press(B::Left)) {
@@ -383,9 +485,33 @@ void SequencerScene::handleInput() {
         if (selectHeld) { m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS; m_selectChordFired = true; }
         else            { m_cursorStep = (m_cursorStep + 1) % NUM_STEPS; }
     }
-    // D-pad UD → KNOB 1 ± (always; no Select chord here yet).
-    if (press(B::Up))    knobBump(m_knobs[v], m_currentSynth, 0, +1);
-    if (press(B::Down))  knobBump(m_knobs[v], m_currentSynth, 0, -1);
+
+    // D-pad UD. On drum synths it's always KNOB 1. On 303 synths the
+    // default action is per-step note (TB-303-style sequencer entry); add
+    // Select to bump KNOB 1 (CUT) instead.
+    auto bumpNote = [&](int delta) {
+        auto &s = m_acidExtras[m_currentPattern][acidSlot][m_cursorStep];
+        int n = static_cast<int>(s.note) + delta;
+        if (n < -12) n = -12;
+        if (n >  24) n =  24;
+        s.note = static_cast<int8_t>(n);
+    };
+    if (press(B::Up)) {
+        if (isAcid && !selectHeld) {
+            bumpNote(+1);
+        } else {
+            knobBump(m_knobs[v], m_currentSynth, 0, +1);
+            if (isAcid && selectHeld) m_selectChordFired = true;
+        }
+    }
+    if (press(B::Down)) {
+        if (isAcid && !selectHeld) {
+            bumpNote(-1);
+        } else {
+            knobBump(m_knobs[v], m_currentSynth, 0, -1);
+            if (isAcid && selectHeld) m_selectChordFired = true;
+        }
+    }
 
     // Transport.
     if (press(B::Start)) m_running = !m_running;
@@ -419,9 +545,51 @@ void SequencerScene::advancePlayback() {
 
     for (int v = 0; v < NUM_VOICES; ++v) {
         if (m_voicePatterns[m_playingPattern][v] & (uint16_t(1) << m_playStep)) {
-            triggerVoice(CH_PER_VOICE(v), g_voices[v], m_knobs[v]);
+            int slot = acidSlotForVoice(v);
+            if (slot >= 0) {
+                triggerAcidVoice(CH_PER_VOICE(v), g_voices[v], m_knobs[v],
+                                 m_acidExtras[m_playingPattern][slot][m_playStep]);
+            } else {
+                triggerVoice(CH_PER_VOICE(v), g_voices[v], m_knobs[v]);
+            }
         }
     }
+}
+
+void SequencerScene::randomizeAcidPattern(int acidSlot, int voiceIdx) {
+    // Re-seed with frame counter so successive randomizes produce different
+    // patterns even though the LCG itself is deterministic.
+    m_randState ^= m_frameCounter * 0x9E3779B1u + 0xCAFEBABEu;
+
+    uint16_t mask = 0;
+    for (int s = 0; s < NUM_STEPS; ++s) {
+        uint32_t r = lcg();
+
+        // ~62% step density — sparse enough to leave gaps, dense enough
+        // that 16 steps usually feel like a line.
+        bool active = ((r & 0xFF) < 0xA0);
+        if (active) mask |= (uint16_t(1) << s);
+
+        AcidStep &step = m_acidExtras[m_currentPattern][acidSlot][s];
+
+        // Note pool: pentatonic-ish range within an octave, biased low
+        // so the line still sounds like a bassline rather than a melody.
+        static constexpr int8_t POOL[16] = {
+             0,  0,  3,  5,
+             7,  7, 10, 12,
+            -2, -5,  0,  2,
+             5,  7,  3, -7,
+        };
+        step.note = POOL[(r >> 8) & 0xF];
+
+        uint8_t flags = 0;
+        if (active) {
+            if (((r >> 16) & 0xFF) < 0x55) flags |= ACID_ACCENT;  // ~33%
+            if (((r >> 24) & 0xFF) < 0x40) flags |= ACID_SLIDE;   // ~25%
+        }
+        step.flags = flags;
+    }
+    m_voicePatterns[m_currentPattern][voiceIdx] = mask;
 }
 
 void SequencerScene::draw() {
@@ -529,6 +697,45 @@ void SequencerScene::draw() {
                             isSelected ? white : dim);
     }
 
+    // On 303 synths, show the cursor step's per-step parameters (note, accent,
+    // slide) in the space to the right of the voice picker.
+    {
+        int curAcidSlotPanel = acidSlotForVoice(v);
+        if (curAcidSlotPanel >= 0) {
+            const AcidStep &as = m_acidExtras[m_currentPattern][curAcidSlotPanel][m_cursorStep];
+            int detailX = PICK_X0 + syn.voiceCount * (PICK_W + PICK_GAP) + 12;
+            int detailY = PICK_Y0;
+            // Line 1: "S nn  N+/-NN"
+            char top[10];
+            int sn = m_cursorStep + 1;
+            top[0] = 'S';
+            top[1] = '0' + static_cast<char>((sn / 10) % 10);
+            top[2] = '0' + static_cast<char>(sn % 10);
+            top[3] = ' ';
+            top[4] = 'N';
+            int n = as.note;
+            top[5] = (n < 0) ? '-' : '+';
+            if (n < 0) n = -n;
+            if (n > 99) n = 99;
+            top[6] = '0' + static_cast<char>((n / 10) % 10);
+            top[7] = '0' + static_cast<char>(n % 10);
+            top[8] = '\0';
+            acidRom.m_font.print(acidRom.gpu(), top,
+                {{.x = static_cast<int16_t>(detailX),
+                  .y = static_cast<int16_t>(detailY)}}, white);
+
+            // Line 2: accent / slide tags. Lit when flag is on.
+            acidRom.m_font.print(acidRom.gpu(), "ACC",
+                {{.x = static_cast<int16_t>(detailX),
+                  .y = static_cast<int16_t>(detailY + 12)}},
+                (as.flags & ACID_ACCENT) ? amber : dim);
+            acidRom.m_font.print(acidRom.gpu(), "SLD",
+                {{.x = static_cast<int16_t>(detailX + 32),
+                  .y = static_cast<int16_t>(detailY + 12)}},
+                (as.flags & ACID_SLIDE) ? amber : dim);
+        }
+    }
+
     // ============ Step row (16 LEDs) ============
     constexpr int STEP_Y    = 100;
     constexpr int STEP_X0   = 16;
@@ -537,14 +744,29 @@ void SequencerScene::draw() {
     constexpr int STEP_GAP  = 3;
 
     uint16_t pattern = m_voicePatterns[m_currentPattern][v];
+    int curAcidSlot = acidSlotForVoice(v);
+    bool curIsAcid  = curAcidSlot >= 0;
     for (int s = 0; s < NUM_STEPS; ++s) {
         int x = STEP_X0 + s * (STEP_W + STEP_GAP);
         bool active   = (pattern & (uint16_t(1) << s)) != 0;
         bool playing  = m_running && (s == m_playStep);
         bool isCursor = (s == m_cursorStep);
 
+        bool stepAccent = false;
+        bool stepSlide  = false;
+        if (curIsAcid) {
+            const AcidStep &as = m_acidExtras[m_currentPattern][curAcidSlot][s];
+            stepAccent = (as.flags & ACID_ACCENT) != 0;
+            stepSlide  = (as.flags & ACID_SLIDE)  != 0;
+        }
+
         psyqo::Color c = scol;
         if (!active) { c.r >>= 3; c.g >>= 3; c.b >>= 3; }
+        else if (stepAccent) {
+            c.r = c.r > 200 ? 255 : c.r + 55;
+            c.g = c.g > 200 ? 255 : c.g + 55;
+            c.b = c.b > 200 ? 255 : c.b + 55;
+        }
         if (playing && active) {
             c.r = c.r > 200 ? 255 : c.r + 55;
             c.g = c.g > 200 ? 255 : c.g + 55;
@@ -554,6 +776,22 @@ void SequencerScene::draw() {
         led.position = {{.x = static_cast<int16_t>(x), .y = STEP_Y}};
         led.size     = {{.x = STEP_W, .y = STEP_H}};
         acidRom.gpu().sendPrimitive(led);
+
+        // Accent tag: tiny bright bar across the top edge of an active step.
+        if (curIsAcid && active && stepAccent) {
+            psyqo::Prim::Rectangle accTag{white};
+            accTag.position = {{.x = static_cast<int16_t>(x + 2), .y = STEP_Y + 2}};
+            accTag.size     = {{.x = STEP_W - 4, .y = 2}};
+            acidRom.gpu().sendPrimitive(accTag);
+        }
+        // Slide tag: underline at the bottom — tying current to next step.
+        if (curIsAcid && active && stepSlide) {
+            psyqo::Prim::Rectangle slTag{amber};
+            slTag.position = {{.x = static_cast<int16_t>(x + 2), .y = STEP_Y + STEP_H - 4}};
+            slTag.size     = {{.x = STEP_W - 4, .y = 2}};
+            acidRom.gpu().sendPrimitive(slTag);
+        }
+
         if ((s & 3) == 0) {
             psyqo::Prim::Rectangle qb{cyan};
             qb.position = {{.x = static_cast<int16_t>(x + 6), .y = STEP_Y - 5}};
@@ -662,12 +900,22 @@ void SequencerScene::draw() {
     }
 
     // ============ Footer help ============
-    acidRom.m_font.print(acidRom.gpu(),
-        "XOZS:synth  Q/R:voice  A/F:step OFF/ON",
-        {{.x = 4, .y = 208}}, dim);
-    acidRom.m_font.print(acidRom.gpu(),
-        "LR:cur  UD:k1  BS+QR:k2  BS+LR:pat",
-        {{.x = 4, .y = 220}}, dim);
+    // Help text differs between 303 (note-entry layout) and drums.
+    if (isAcidSynth(m_currentSynth)) {
+        acidRom.m_font.print(acidRom.gpu(),
+            "XOZS:synth  Q/R:voice  UD:NOTE  LR:cur",
+            {{.x = 4, .y = 208}}, dim);
+        acidRom.m_font.print(acidRom.gpu(),
+            "A/F:OFF/ON  BS+A:acc  BS+F:sld  BS+/\\:rnd",
+            {{.x = 4, .y = 220}}, dim);
+    } else {
+        acidRom.m_font.print(acidRom.gpu(),
+            "XOZS:synth  Q/R:voice  A/F:step OFF/ON",
+            {{.x = 4, .y = 208}}, dim);
+        acidRom.m_font.print(acidRom.gpu(),
+            "LR:cur  UD:k1  BS+QR:k2  BS+LR:pat",
+            {{.x = 4, .y = 220}}, dim);
+    }
 }
 
 void SequencerScene::frame() {
