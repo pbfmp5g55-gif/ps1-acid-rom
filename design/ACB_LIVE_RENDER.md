@@ -1,6 +1,6 @@
 # ACB Live Render on PS1 — Design Doc
 
-**Status**: 13/13 voice live ✅ 2026-05-23 (Phase 1-7 + 9 完了)。残: Phase 8 統合チューニング (実機 CPU 計測)、Phase 10 最終耳判定。
+**Status**: 13 voice 実装完了、 streaming engine 動作確認 ✅ (1 kHz sine 大音量 OK)。 ただし **未解決**: (a) 13 voice 同時 tick は R3000A の予算超え → 暫定 4 voice live、 残り 9 voice sample、 (b) ACB voice の音量が「全体小さい」、 user 体感で acid sound 楽しめるレベル未達。 Phase 8 統合チューニング継続中、 次セッションで音量問題 + CPU 予算 + main.cpp triggerVoice uint16_t バグ対応。
 **Goal**: PS1 上で全主要 voice (303×2 + 808 + 909 のうち 10 voice) を
 **component-level な ACB (Analog Circuit Behavior) ローポリモデル** で
 **毎サンプル live render** する。Roland TR-8 / System-1 が PC でやってる事を
