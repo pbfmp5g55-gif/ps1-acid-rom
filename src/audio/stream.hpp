@@ -51,4 +51,23 @@ void initialize();
 // Phase 3+ will replace this with the live mix from acid::engine.
 void tick();
 
+// Pick what the next refill writes into the buffer:
+//   SILENT — zeros (default after Phase 3+)
+//   SINE   — 1 kHz test tone for streaming-chain verification
+//   ACB    — live mix of the integrated ACB voices
+enum class FillMode : uint8_t { Silent, Sine, Acb };
+void set_fill_mode(FillMode m);
+
+// ---- Phase 3 wiring -------------------------------------------------------
+// The streaming engine owns one TB-303 stage 1 instance. The sequencer
+// triggers it from triggerAcidVoice() when the SAW voice fires.
+//
+// noteOffset: semitones above/below the base note (A2 ≈ 110 Hz).
+void trigger_tb303_stage1(int noteOffset, bool slide, bool accent);
+
+// Push the SequencerScene knob bank (0..255 uint8_t) down to the voice.
+// Called whenever knobs change so the next note picks up the new params.
+void set_tb303_stage1_knobs(int cutoff8, int reso8, int envMod8,
+                            int decay8, int accent8);
+
 }  // namespace acid::audio::stream

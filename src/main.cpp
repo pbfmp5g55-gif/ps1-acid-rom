@@ -717,8 +717,18 @@ void SequencerScene::advancePlayback() {
         if (m_voicePatterns[m_playingPattern][v] & (uint16_t(1) << m_playStep)) {
             int slot = acidSlotForVoice(v);
             if (slot >= 0) {
-                triggerAcidVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v],
-                                 m_acidExtras[m_playingPattern][slot][m_playStep]);
+                const AcidStep &step = m_acidExtras[m_playingPattern][slot][m_playStep];
+                // Phase 3 hybrid: voice 7 (TB-303 STG1 SAW) routes through
+                // the live ACB engine on the streaming channel. All other
+                // voices keep the SPU sample playback path.
+                if (v == 7) {
+                    acid::audio::stream::trigger_tb303_stage1(
+                        static_cast<int>(step.note),
+                        (step.flags & ACID_SLIDE)  != 0,
+                        (step.flags & ACID_ACCENT) != 0);
+                } else {
+                    triggerAcidVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v], step);
+                }
             } else {
                 triggerVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v]);
             }
@@ -1134,6 +1144,14 @@ void SequencerScene::frame() {
 
     handleInput();
     advancePlayback();
+    // Push the TB-303 STG1 (voice 7) knob bank to the ACB live engine so
+    // the user can hear knobs change in real time. Accent depth is hard-
+    // coded to 0.5 for now — future M will expose it as a 5th knob.
+    {
+        const RowKnobs &k = m_knobs[7];
+        acid::audio::stream::set_tb303_stage1_knobs(
+            k.cutoff, k.reso, k.envMod, k.decay, 128);
+    }
     draw();
 
     // M9 PSVJ sync stripe — keep the contract.

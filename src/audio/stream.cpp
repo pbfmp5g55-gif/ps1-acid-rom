@@ -4,6 +4,7 @@
 #include "audio/adpcm_encode.hpp"
 
 #include "dsp/qmath.hpp"
+#include "voices/acb_tb303_stage1.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -75,7 +76,26 @@ void fill_test_sine() {
 // Phase-2-only switch: while true, fill with the 1 kHz beep so we can
 // verify the streaming chain by ear. Phase 3 will flip this off and route
 // the ACB voice mix through fill_silence-style rendering.
-bool g_test_sine_active = true;
+bool g_test_sine_active = false;
+
+// Phase 3: live mix of the ACB-modelled voices. Phase 3 wires only the
+// TB-303 stage 1 (SAW); later phases add more voices and sum them here.
+acid::voices::AcbTb303Stage1 g_tb303_stage1;
+
+// Active fill mode. After Phase 3 we default to ACB so live render kicks
+// in immediately; the OptionsScene can flip the user back to SILENT/SINE
+// for debugging.
+FillMode g_fillMode = FillMode::Acb;
+
+void fill_acb_mix() {
+    using acid::dsp::Q24_SHIFT;
+    for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
+        // Phase 3: single voice → directly use its sample. Phase 4+
+        // sums multiple voices here and clamps.
+        int32_t s = g_tb303_stage1.tick();
+        g_pcmBuf[i] = static_cast<int16_t>(s);
+    }
+}
 
 void dma_to_spu(uint32_t spuAddr) {
     psyqo::SPU::dmaWrite(spuAddr, g_encodedBuf,
@@ -89,7 +109,12 @@ void initialize() {
 
     // Pre-load both buffers with silence so the SPU has something safe to
     // play immediately and the chain A→B→A keeps running.
-    if (g_test_sine_active) fill_test_sine(); else fill_silence();
+    switch (g_fillMode) {
+        case FillMode::Sine:   fill_test_sine(); break;
+        case FillMode::Acb:    fill_acb_mix();   break;
+        case FillMode::Silent:
+        default:               fill_silence();   break;
+    }
     encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
     dma_to_spu(SPU_BUFFER_A_ADDR);
     encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
@@ -136,7 +161,12 @@ void tick() {
     // so the next firing tells us B is consumed.
     if (g_activeBuf == 0) {
         // We were playing A, IRQ fired at B start → refill A.
-        if (g_test_sine_active) fill_test_sine(); else fill_silence();  // Phase 2: silence only.
+        switch (g_fillMode) {
+        case FillMode::Sine:   fill_test_sine(); break;
+        case FillMode::Acb:    fill_acb_mix();   break;
+        case FillMode::Silent:
+        default:               fill_silence();   break;
+    }  // Phase 2: silence only.
         encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
         // Update repeat addr so the next loop_end in B jumps back to A.
         SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
@@ -145,7 +175,12 @@ void tick() {
         SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
         g_activeBuf = 1;
     } else {
-        if (g_test_sine_active) fill_test_sine(); else fill_silence();
+        switch (g_fillMode) {
+        case FillMode::Sine:   fill_test_sine(); break;
+        case FillMode::Acb:    fill_acb_mix();   break;
+        case FillMode::Silent:
+        default:               fill_silence();   break;
+    }
         encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
         SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
             static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
@@ -153,6 +188,45 @@ void tick() {
         SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
         g_activeBuf = 0;
     }
+}
+
+// ---- Phase 3 public API ---------------------------------------------------
+
+void set_fill_mode(FillMode m) { g_fillMode = m; }
+
+namespace {
+
+inline acid::dsp::i32 byte_to_q24(int x8) {
+    return (static_cast<acid::dsp::i32>(x8) << 24) / 255;
+}
+
+}  // namespace
+
+void trigger_tb303_stage1(int noteOffset, bool slide, bool accent) {
+    using acid::dsp::i32;
+    // A2 = 110 Hz at noteOffset 0. Decompose offset into whole octaves +
+    // fractional semitones; use pow2 LUT for the fractional part and a
+    // shift for whole octaves.
+    constexpr i32 BASE_HZ_Q24 = 110 << acid::dsp::Q24_SHIFT;
+    int shifted = noteOffset + 12;     // map [-12, +24] → [0, 36]
+    int whole_oct = shifted / 12 - 1;  // -1..+2 from the +12 shift
+    int frac_semi = shifted % 12;      // 0..11
+    i32 fracParam = (static_cast<i32>(frac_semi) << acid::dsp::Q24_SHIFT) / 12;
+    i32 ratio = acid::dsp::pow2_unit_q24(fracParam);  // [ONE, 2*ONE]
+    int64_t hz = (static_cast<int64_t>(BASE_HZ_Q24) * static_cast<int64_t>(ratio))
+                 >> acid::dsp::Q24_SHIFT;
+    if (whole_oct > 0)      hz <<=  whole_oct;
+    else if (whole_oct < 0) hz >>= -whole_oct;
+    g_tb303_stage1.noteOn(static_cast<i32>(hz), slide, accent);
+}
+
+void set_tb303_stage1_knobs(int cutoff8, int reso8, int envMod8,
+                            int decay8, int accent8) {
+    g_tb303_stage1.setCutoff(byte_to_q24(cutoff8));
+    g_tb303_stage1.setResonance(byte_to_q24(reso8));
+    g_tb303_stage1.setEnvMod(byte_to_q24(envMod8));
+    g_tb303_stage1.setDecay(byte_to_q24(decay8));
+    g_tb303_stage1.setAccentAmount(byte_to_q24(accent8));
 }
 
 }  // namespace acid::audio::stream
