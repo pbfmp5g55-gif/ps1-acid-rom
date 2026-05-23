@@ -40,6 +40,13 @@ foreach(voice bd sd tom hh cy cp cb tb303 r909bd r909sd tb303s2)
     add_test(NAME ${voice}_basic COMMAND test_${voice}_basic)
 endforeach()
 
+# Phase 1 of ACB live render (see design/ACB_LIVE_RENDER.md): verify the
+# Q24 LUT versions of sin/cos/exp/tanh/pow2 stay within tolerance of
+# std::cmath. The same qmath.hpp is included in the PS1 build.
+add_executable(test_qmath test_qmath.cpp)
+target_include_directories(test_qmath PRIVATE ../src)
+add_test(NAME qmath COMMAND test_qmath)
+
 # Build-time helper that pre-renders each voice and emits a generated header
 # of PSX ADPCM bytes for the PS1 build to embed and play via SPU. Run
 # manually (or via `cmake --build . --target gen_voice_samples`) after any
