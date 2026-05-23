@@ -29,10 +29,14 @@ constexpr int BLOCKS_PER_BUFFER = 64;
 constexpr int BYTES_PER_BUFFER  = BLOCKS_PER_BUFFER * BYTES_PER_BLOCK;  // 1024
 constexpr int SAMPLES_PER_BUFFER = BLOCKS_PER_BUFFER * SAMPLES_PER_BLOCK;
 
-// SPU RAM placement: streaming buffers live well above the static voice
-// samples (which are uploaded starting at 0x1100 in main.cpp::prepare).
-// 0x10000 leaves ~60 KB of headroom for sample voices before we collide.
-constexpr uint32_t SPU_BUFFER_A_ADDR = 0x10000;
+// SPU RAM placement: streaming buffers MUST sit above the static voice
+// samples. The 13 voice ADPCM samples (BD/SD/.../SQ2) total ~160 KB
+// uploaded starting at 0x1100, ending around 0x29000. We park the stream
+// at 0x30000 (192 KB) with ~250 KB of headroom before the reverb area
+// (0x70000). Earlier placement at 0x10000 was inside the voice sample
+// range and silently overwrote our stream buffers as voices DMA'd in
+// (= total silence on channel 23, even with sine fill).
+constexpr uint32_t SPU_BUFFER_A_ADDR = 0x30000;
 constexpr uint32_t SPU_BUFFER_B_ADDR = SPU_BUFFER_A_ADDR + BYTES_PER_BUFFER;
 
 // We hijack the highest channel for the live mix. The sequencer's 13
