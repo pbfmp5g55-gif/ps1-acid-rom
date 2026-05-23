@@ -66,9 +66,11 @@ void fill_test_sine() {
     using acid::dsp::sin_q24;
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
         g_sine_phase += SINE_PHASE_INC_1KHZ;
-        // DEBUG: louder than before so a working streaming chain is
-        // obviously audible. Q24 unity → 32767-ish in i16 with >>9.
-        int32_t s = sin_q24(g_sine_phase) >> 10;  // ~ ±16384, -6 dBFS
+        // Full i16 range. SPU master defaults to 0x3fff (-6 dB) and we'll
+        // override to 0x7fff in initialize() so the chain is +0 dBFS.
+        int32_t s = sin_q24(g_sine_phase) >> 9;
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
     }
 }
@@ -181,13 +183,18 @@ void initialize() {
 
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     cfg.sampleRate.value = 0x1000;
-    cfg.volumeLeft  = 0x3fff;
-    cfg.volumeRight = 0x3fff;
+    cfg.volumeLeft  = 0x7fff;   // +0 dB (max signed-15)
+    cfg.volumeRight = 0x7fff;
     cfg.adsr        = 0x1fffc0ff;
     psyqo::SPU::playADPCM(STREAM_CHANNEL,
                           static_cast<uint16_t>(SPU_BUFFER_A_ADDR), cfg, true);
     SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
         static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
+
+    // Crank SPU master volume to max — psyqo defaults to 0x3fff (-6 dB)
+    // which made our streaming output sound barely audible.
+    SPU_VOL_MAIN_LEFT  = 0x7fff;
+    SPU_VOL_MAIN_RIGHT = 0x7fff;
 
     g_initialized = true;
 }
