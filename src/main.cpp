@@ -15,18 +15,22 @@
 //   R2                      stick "fine" modifier (hold)
 //   D-pad ←→                step cursor
 //   D-pad ↑↓                KNOB 1 ± (PIT for drums)
-//   Select + L1 / R1        KNOB 2 − / +
-//   Select + D-pad ←→       pattern slot prev / next
-//   Start                   play / stop
-//   Select (tap, no chord)  chain length cycle
+//   Start                   play / stop  (when SHIFT is off)
+//   Start                   chain length cycle  (when SHIFT is on)
+//   Select                  toggle SHIFT mode (latching modifier)
 //
-// On TB-303 synths the same buttons gain per-step note entry plus live
+// SHIFT (lit in the header when active) re-routes:
+//   SHIFT + L1 / R1         KNOB 2 − / +
+//   SHIFT + D-pad ←→        pattern slot prev / next
+//   SHIFT + D-pad ↑↓        KNOB 1 ± on 303 (drum stays plain)
+//   SHIFT + L2              accent toggle (303)
+//   SHIFT + R2              slide  toggle (303)
+//   SHIFT + △ (Triangle)    randomize current pattern (303)
+//   SHIFT + Start           chain length cycle
+//
+// On TB-303 synths the D-pad ↑↓ becomes per-step note entry, plus live
 // analog-stick filter control (DualShock):
 //   D-pad ↑↓                cursor step note ± 1 semitone
-//   Select + D-pad ↑↓       KNOB 1 ± (CUT)  -- voice-wide
-//   Select + L2             accent toggle on cursor step
-//   Select + R2             slide  toggle on cursor step
-//   Select + △ (Triangle)   randomize current pattern (notes/acc/slide/active)
 //   Left  stick X / Y       live CUT / RES
 //   Right stick X / Y       live ENV / DCY
 //   R2 (hold)               while held, sticks move ~1/4 the speed (fine)
@@ -353,10 +357,10 @@ class SequencerScene final : public psyqo::Scene {
 
     RowKnobs m_knobs[NUM_VOICES];
 
-    // Select-modifier state. Cleared when Select is pressed, set whenever
-    // any chord with Select held fires. On Select release, if no chord
-    // fired we treat the press as a "tap" and cycle the chain length.
-    bool m_selectChordFired = false;
+    // SHIFT is a latching modifier toggled by every Select edge-press.
+    // When on, all buttons that previously had Select-chord meanings
+    // produce those meanings instead of their default ones.
+    bool m_shiftMode = false;
 
     uint16_t m_prevButtons[2] = {0, 0};
 
@@ -426,26 +430,22 @@ void SequencerScene::handleInput() {
         return now && !wasDown;
     };
 
-    // Select-as-modifier: clear chord flag on press, and figure out whether
-    // Select is being held this frame so other handlers can branch. Done
-    // before face-button dispatch so synth jumps can be inhibited by chord.
-    bool selectHeld = pad.isButtonPressed(P::Pad1a, B::Select);
-    bool selectWasHeld = (m_prevButtons[0] & (1 << B::Select)) == 0;
-    if (selectHeld && !selectWasHeld) m_selectChordFired = false;
+    // SHIFT is a latching modifier: every Select edge-press toggles it,
+    // and the LED in the header shows the state. No more "tap vs chord"
+    // disambiguation, no holding required.
+    if (press(B::Select)) m_shiftMode = !m_shiftMode;
+    const bool shift = m_shiftMode;
 
-    // Face buttons → synth select. Each instantly jumps the screen to that
-    // synth's view. The voice selection inside is remembered per-synth so
-    // bouncing between machines is non-destructive. Select+Triangle is
-    // captured as the acid-randomize chord and does NOT jump to 909.
+    // Face buttons → synth select by default. SHIFT + Triangle on a 303
+    // synth is captured as the randomize chord and does NOT jump to 909.
     if (press(B::Cross))    m_currentSynth = 0;   // ×  303 STG1
     if (press(B::Circle))   m_currentSynth = 1;   // ○  303 STG2
     if (press(B::Square))   m_currentSynth = 2;   // □  808
     if (press(B::Triangle)) {
         int v0 = selectedVoice();
         int slot0 = acidSlotForVoice(v0);
-        if (selectHeld && slot0 >= 0) {
+        if (shift && slot0 >= 0) {
             randomizeAcidPattern(slot0, v0);
-            m_selectChordFired = true;
         } else {
             m_currentSynth = 3;
         }
@@ -455,51 +455,48 @@ void SequencerScene::handleInput() {
 
     int v = selectedVoice();
 
-    // L1 / R1: voice prev / next (default), or KNOB 2 − / + when Select held.
+    // L1 / R1: voice prev / next (default), or KNOB 2 ± when SHIFT.
     if (press(B::L1)) {
-        if (selectHeld) { knobBump(m_knobs[v], m_currentSynth, 1, -1); m_selectChordFired = true; }
-        else            { m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + syn.voiceCount - 1) % syn.voiceCount; }
+        if (shift) knobBump(m_knobs[v], m_currentSynth, 1, -1);
+        else       m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + syn.voiceCount - 1) % syn.voiceCount;
     }
     if (press(B::R1)) {
-        if (selectHeld) { knobBump(m_knobs[v], m_currentSynth, 1, +1); m_selectChordFired = true; }
-        else            { m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + 1) % syn.voiceCount; }
+        if (shift) knobBump(m_knobs[v], m_currentSynth, 1, +1);
+        else       m_voiceInSynth[m_currentSynth] = (m_voiceInSynth[m_currentSynth] + 1) % syn.voiceCount;
     }
 
-    // Re-read v after voice change (in case L1/R1 changed it without Select).
+    // Re-read v after voice change (in case L1/R1 changed it without SHIFT).
     v = selectedVoice();
     int acidSlot = acidSlotForVoice(v);
     bool isAcid = acidSlot >= 0;
 
-    // L2: step toggle at cursor (active <-> off). On 303 voices, Select
-    // turns L2 into the per-step accent toggle.
+    // L2: step toggle at cursor (active <-> off). With SHIFT on a 303
+    // voice it becomes the per-step accent toggle.
     if (press(B::L2)) {
-        if (selectHeld && isAcid) {
+        if (shift && isAcid) {
             m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_ACCENT;
-            m_selectChordFired = true;
         } else {
             m_voicePatterns[m_currentPattern][v] ^= (uint16_t(1) << m_cursorStep);
         }
     }
-    // R2: hold-only "fine" modifier for the analog sticks (no edge action).
-    // Select+R2 is still the per-step slide toggle on 303 voices.
-    if (press(B::R2) && selectHeld && isAcid) {
+    // R2: stick "fine" modifier (read separately as a hold below). With
+    // SHIFT on a 303 voice the edge press toggles per-step slide.
+    if (press(B::R2) && shift && isAcid) {
         m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_SLIDE;
-        m_selectChordFired = true;
     }
 
-    // D-pad LR: step cursor (default), or pattern slot prev/next when Select held.
+    // D-pad LR: step cursor (default), or pattern slot prev/next under SHIFT.
     if (press(B::Left)) {
-        if (selectHeld) { m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS; m_selectChordFired = true; }
-        else            { m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS; }
+        if (shift) m_currentPattern = (m_currentPattern + NUM_PATTERNS - 1) % NUM_PATTERNS;
+        else       m_cursorStep = (m_cursorStep + NUM_STEPS - 1) % NUM_STEPS;
     }
     if (press(B::Right)) {
-        if (selectHeld) { m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS; m_selectChordFired = true; }
-        else            { m_cursorStep = (m_cursorStep + 1) % NUM_STEPS; }
+        if (shift) m_currentPattern = (m_currentPattern + 1) % NUM_PATTERNS;
+        else       m_cursorStep = (m_cursorStep + 1) % NUM_STEPS;
     }
 
-    // D-pad UD. On drum synths it's always KNOB 1. On 303 synths the
-    // default action is per-step note (TB-303-style sequencer entry); add
-    // Select to bump KNOB 1 (CUT) instead.
+    // D-pad UD. Drum synths always bump KNOB 1. On 303 synths the default
+    // action is per-step note (TB-303 style); SHIFT bumps KNOB 1 (CUT).
     auto bumpNote = [&](int delta) {
         auto &s = m_acidExtras[m_currentPattern][acidSlot][m_cursorStep];
         int n = static_cast<int>(s.note) + delta;
@@ -508,30 +505,22 @@ void SequencerScene::handleInput() {
         s.note = static_cast<int8_t>(n);
     };
     if (press(B::Up)) {
-        if (isAcid && !selectHeld) {
-            bumpNote(+1);
-        } else {
-            knobBump(m_knobs[v], m_currentSynth, 0, +1);
-            if (isAcid && selectHeld) m_selectChordFired = true;
-        }
+        if (isAcid && !shift) bumpNote(+1);
+        else                  knobBump(m_knobs[v], m_currentSynth, 0, +1);
     }
     if (press(B::Down)) {
-        if (isAcid && !selectHeld) {
-            bumpNote(-1);
-        } else {
-            knobBump(m_knobs[v], m_currentSynth, 0, -1);
-            if (isAcid && selectHeld) m_selectChordFired = true;
-        }
+        if (isAcid && !shift) bumpNote(-1);
+        else                  knobBump(m_knobs[v], m_currentSynth, 0, -1);
     }
 
-    // Transport.
-    if (press(B::Start)) m_running = !m_running;
-
-    // Chain length on Select tap (released with no chord having fired).
-    bool selectJustReleased = !selectHeld && selectWasHeld;
-    if (selectJustReleased && !m_selectChordFired) {
-        m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
-        m_chainPos = 0;
+    // Start: play/stop by default; under SHIFT it cycles chain length.
+    if (press(B::Start)) {
+        if (shift) {
+            m_chainLength = (m_chainLength % NUM_PATTERNS) + 1;
+            m_chainPos = 0;
+        } else {
+            m_running = !m_running;
+        }
     }
 
     // Analog sticks → live knob bumps (303 mode only). DualShock in analog
@@ -657,7 +646,12 @@ void SequencerScene::draw() {
     acidRom.m_font.print(acidRom.gpu(), chnBuf, {{.x = 208, .y = 6}}, white);
     acidRom.m_font.print(acidRom.gpu(),
         reverb::enabled() ? "REV" : "DRY",
-        {{.x = 256, .y = 6}}, reverb::enabled() ? cyan : dim);
+        {{.x = 248, .y = 6}}, reverb::enabled() ? cyan : dim);
+    // SHIFT latch indicator: bright amber when modifier mode is on so the
+    // user always knows whether a button does its default or shifted action.
+    acidRom.m_font.print(acidRom.gpu(),
+        m_shiftMode ? "SHIFT" : "shift",
+        {{.x = 272, .y = 6}}, m_shiftMode ? amber : dim);
 
     // ============ Synth tabs (× ○ □ △ row) ============
     // Four equal-width tabs across the top, each labeled with both the face
@@ -950,21 +944,40 @@ void SequencerScene::draw() {
     }
 
     // ============ Footer help ============
-    // Help text differs between 303 (note-entry + sticks) and drums.
+    // BS now toggles SHIFT (not held). Help shows the action for the
+    // current SHIFT state so the user can read what each button will do.
     if (isAcidSynth(m_currentSynth)) {
-        acidRom.m_font.print(acidRom.gpu(),
-            "XDZS:syn Q/R:voi UD:note A:tgl LR:cur",
-            {{.x = 4, .y = 208}}, dim);
-        acidRom.m_font.print(acidRom.gpu(),
-            "BS+A:acc BS+F:sld BS+S:rnd L/RStk:knob",
-            {{.x = 4, .y = 220}}, dim);
+        if (m_shiftMode) {
+            acidRom.m_font.print(acidRom.gpu(),
+                "[SHF] A:acc F:sld S:rnd LR:pat UD:CUT",
+                {{.x = 4, .y = 208}}, amber);
+            acidRom.m_font.print(acidRom.gpu(),
+                "Q/R:RES Enter:chain  BS:shift off",
+                {{.x = 4, .y = 220}}, dim);
+        } else {
+            acidRom.m_font.print(acidRom.gpu(),
+                "XDZS:syn Q/R:voi UD:note A:tgl LR:cur",
+                {{.x = 4, .y = 208}}, dim);
+            acidRom.m_font.print(acidRom.gpu(),
+                "L/RStk:knob R2:fine Enter:play BS:SHF",
+                {{.x = 4, .y = 220}}, dim);
+        }
     } else {
-        acidRom.m_font.print(acidRom.gpu(),
-            "XDZS:syn Q/R:voi A:step tgl LR:cur UD:k1",
-            {{.x = 4, .y = 208}}, dim);
-        acidRom.m_font.print(acidRom.gpu(),
-            "BS+QR:k2 BS+LR:pat Enter:play BS:chain",
-            {{.x = 4, .y = 220}}, dim);
+        if (m_shiftMode) {
+            acidRom.m_font.print(acidRom.gpu(),
+                "[SHF] LR:pat Q/R:k2 Enter:chain",
+                {{.x = 4, .y = 208}}, amber);
+            acidRom.m_font.print(acidRom.gpu(),
+                "BS:shift off",
+                {{.x = 4, .y = 220}}, dim);
+        } else {
+            acidRom.m_font.print(acidRom.gpu(),
+                "XDZS:syn Q/R:voi A:step tgl LR:cur",
+                {{.x = 4, .y = 208}}, dim);
+            acidRom.m_font.print(acidRom.gpu(),
+                "UD:k1 Enter:play BS:SHF",
+                {{.x = 4, .y = 220}}, dim);
+        }
     }
 }
 
