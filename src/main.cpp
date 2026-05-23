@@ -544,6 +544,10 @@ void AcidRom::createScene() {
 }
 
 void SequencerScene::start(StartReason) {
+    // Switch the streaming output from Silent (boot pages) to live ACB
+    // mix now that the user is actually playing.
+    acid::audio::stream::set_fill_mode(acid::audio::stream::FillMode::Acb);
+
     // Re-arm playback timer/cursor every time we enter (e.g. coming back
     // from menu): pre-load the accumulator so the very first frame of the
     // scene fires step 0 instead of starting one threshold late.

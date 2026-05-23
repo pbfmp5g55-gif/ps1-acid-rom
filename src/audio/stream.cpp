@@ -101,8 +101,12 @@ bool g_voices_initialized = false;
 // Voice table reminder:
 //   0=BD 1=SD 2=TOM 3=HH 4=CY 5=CP 6=CB 7=SAW 8=SQR 9=BD9 10=SD9
 //   11=SW2 12=SQ2
-// All 13 voices live — full ACB engine, no SPU sample fallback path used.
-constexpr uint32_t LIVE_VOICE_MASK = 0x1FFFu;  // bits 0..12 all set
+// CPU budget: 13 voices was too heavy on the R3000A. Trimmed to the
+// 4 "acid line" voices (303 STG1 SAW/SQR + 808 BD/SD) so each tick is
+// ~4× cheaper. The other voices stay sample-based (SPU channel) until
+// we either lower the internal sample rate or add per-voice gating.
+constexpr uint32_t LIVE_VOICE_MASK =
+    (1u << 0) | (1u << 1) | (1u << 7) | (1u << 8);  // BD, SD, SAW, SQR
 
 void ensure_voices_initialized() {
     if (g_voices_initialized) return;
@@ -113,32 +117,23 @@ void ensure_voices_initialized() {
     g_voices_initialized = true;
 }
 
-// Defaults to ACB live render now that the streaming chain is verified
-// audible (1 kHz sine test at -6 dBFS via FillMode::Sine).
-FillMode g_fillMode = FillMode::Acb;
+// Boot in Silent so Logo/Title/Menu aren't crushed by per-frame 13-voice
+// tick. SequencerScene::start() switches us to Acb when the user actually
+// enters the sequencer.
+FillMode g_fillMode = FillMode::Silent;
 
 void fill_acb_mix() {
     ensure_voices_initialized();
+    // Trimmed-down mix to fit inside the R3000A's budget: only the 4
+    // voices in LIVE_VOICE_MASK get ticked. The rest of NUM_VOICES still
+    // exist as instances (to keep the dispatch switch happy) but aren't
+    // sampled — they stay silent.
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
-        // 10-voice mix. >>3 = -18 dB headroom: at -3 dBFS per voice that
-        // leaves enough margin even with all 10 peaking simultaneously
-        // (unlikely in a typical pattern). Tighten in Phase 8 after CPU
-        // measurements give us the real-world peak budget.
-        int32_t s = static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
-                    static_cast<int32_t>(g_tb303_stg1_sqr.tick()) +
-                    static_cast<int32_t>(g_tb303_stg2_saw.tick()) +
-                    static_cast<int32_t>(g_tb303_stg2_sqr.tick()) +
-                    static_cast<int32_t>(g_808_bd.tick()) +
+        int32_t s = static_cast<int32_t>(g_808_bd.tick()) +
                     static_cast<int32_t>(g_808_sd.tick()) +
-                    static_cast<int32_t>(g_808_tom.tick()) +
-                    static_cast<int32_t>(g_808_cp.tick()) +
-                    static_cast<int32_t>(g_808_cb.tick()) +
-                    static_cast<int32_t>(g_808_hh.tick()) +
-                    static_cast<int32_t>(g_808_cy.tick()) +
-                    static_cast<int32_t>(g_909_bd.tick()) +
-                    static_cast<int32_t>(g_909_sd.tick());
-        // 13 voices, >>3 = -18 dB headroom is conservative.
-        s >>= 3;
+                    static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
+                    static_cast<int32_t>(g_tb303_stg1_sqr.tick());
+        s >>= 2;  // 4-voice mix, -12 dB headroom
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
