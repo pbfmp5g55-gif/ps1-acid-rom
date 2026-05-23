@@ -76,9 +76,9 @@ void fill_test_sine() {
     using acid::dsp::sin_q24;
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
         g_sine_phase += SINE_PHASE_INC_1KHZ;
-        // sin_q24 returns Q24 ∈ [-ONE, ONE]. Shift down to fit s16 with
-        // ~−20 dB headroom so it's easy on the ears.
-        int32_t s = sin_q24(g_sine_phase) >> 13;  // ~ ±2048
+        // DEBUG: louder than before so a working streaming chain is
+        // obviously audible. Q24 unity → 32767-ish in i16 with >>9.
+        int32_t s = sin_q24(g_sine_phase) >> 10;  // ~ ±16384, -6 dBFS
         g_pcmBuf[i] = static_cast<int16_t>(s);
     }
 }
