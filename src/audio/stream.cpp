@@ -12,6 +12,7 @@
 #include "voices/acb_808_cp.hpp"
 #include "voices/acb_909_bd.hpp"
 #include "voices/acb_909_sd.hpp"
+#include "voices/acb_808_cb.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -96,6 +97,7 @@ acid::voices::Acb808Tom      g_808_tom;
 acid::voices::Acb808Cp       g_808_cp;
 acid::voices::Acb909Bd       g_909_bd;
 acid::voices::Acb909Sd       g_909_sd;
+acid::voices::Acb808Cb       g_808_cb;
 bool g_voices_initialized = false;
 
 // Which voice indices (in the main NUM_VOICES table) are live in the ACB
@@ -104,7 +106,7 @@ bool g_voices_initialized = false;
 //   0=BD 1=SD 2=TOM 3=HH 4=CY 5=CP 6=CB 7=SAW 8=SQR 9=BD9 10=SD9
 //   11=SW2 12=SQ2
 constexpr uint32_t LIVE_VOICE_MASK =
-    (1u << 0)  | (1u << 1)  | (1u << 2) | (1u << 5) |       // 808 BD/SD/TOM/CP
+    (1u << 0)  | (1u << 1)  | (1u << 2) | (1u << 5) | (1u << 6) | // 808 BD/SD/TOM/CP/CB
     (1u << 7)  | (1u << 8)  |                                // 303 STG1
     (1u << 9)  | (1u << 10) |                                // 909 BD/SD
     (1u << 11) | (1u << 12);                                 // 303 STG2
@@ -138,6 +140,7 @@ void fill_acb_mix() {
                     static_cast<int32_t>(g_808_sd.tick()) +
                     static_cast<int32_t>(g_808_tom.tick()) +
                     static_cast<int32_t>(g_808_cp.tick()) +
+                    static_cast<int32_t>(g_808_cb.tick()) +
                     static_cast<int32_t>(g_909_bd.tick()) +
                     static_cast<int32_t>(g_909_sd.tick());
         s >>= 3;
@@ -288,6 +291,7 @@ void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
         case 1:  g_808_sd.trigger(vel); break;
         case 2:  g_808_tom.trigger(vel); break;
         case 5:  g_808_cp.trigger(vel); break;
+        case 6:  g_808_cb.trigger(vel); break;
         case 7:  g_tb303_stg1_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
         case 8:  g_tb303_stg1_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
         case 9:  g_909_bd.trigger(vel); break;
@@ -346,6 +350,11 @@ void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
         case 5:
             g_808_cp.setTuning(tuningQ24);
             g_808_cp.setDecay(decayQ24);
+            break;
+        case 6:
+            g_808_cb.setTuning(tuningQ24);
+            g_808_cb.setTone(toneQ24);
+            g_808_cb.setDecay(decayQ24);
             break;
         case 9:
             g_909_bd.setTuning(tuningQ24);
