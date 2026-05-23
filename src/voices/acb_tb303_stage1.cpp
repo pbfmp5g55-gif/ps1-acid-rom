@@ -223,9 +223,10 @@ i16 AcbTb303Stage1::tick() {
         m_envVca = m_envVcaTarget;
     }
 
-    // Q24 → i16. Saw + Q resonance + accent → keep headroom: >> 12 shifts
-    // Q24 unity (= 0x1000000) down to 4096, sat16 clamps the rest.
-    i32 scaled = out >> (Q24_SHIFT - 12);
+    // Q24 → i16 with +12 dB boost vs host shift. The filter heavily
+    // attenuates the saw at low cutoff so we need the headroom to keep
+    // the voice audible in the live mix.
+    i32 scaled = out >> (Q24_SHIFT - 14);
     return sat16(scaled);
 }
 

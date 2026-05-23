@@ -133,7 +133,10 @@ void fill_acb_mix() {
                     static_cast<int32_t>(g_808_sd.tick()) +
                     static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
                     static_cast<int32_t>(g_tb303_stg1_sqr.tick());
-        s >>= 2;  // 4-voice mix, -12 dB headroom
+        // -6 dB mix gain. Simultaneous peaks across all 4 voices will
+        // clip — sat16 below handles that — but voice peaks rarely line
+        // up in a real pattern, so the average loudness is what matters.
+        s >>= 1;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
