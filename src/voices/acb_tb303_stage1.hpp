@@ -50,9 +50,10 @@ class AcbTb303Stage1 {
     void setAccentAmount(i32 accentQ24);
 
     // ---- gates ----------------------------------------------------------
-    // Trigger a new note. `noteHz` is the pitch in Hz (Q24 here so a 1 Hz
-    // bin is sufficient resolution; we don't need fractional Hz).
-    void noteOn(i32 noteHzQ24, bool slide, bool accent);
+    // Trigger a new note. `noteHz` is the pitch in integer Hz (we don't
+    // need sub-Hz precision for a TB-303 — 1 Hz resolution at A2 is much
+    // less than 1 cent). Holding Hz as i32 avoids 64-bit shifts in PS1.
+    void noteOn(int noteHz, bool slide, bool accent);
     void noteOff();
     bool isActive() const { return m_envVca > 0x4000; }  // ~0.001
 

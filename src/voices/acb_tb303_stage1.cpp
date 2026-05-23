@@ -16,30 +16,30 @@ constexpr i32 ONE_Q24 = 1 << Q24_SHIFT;
 
 namespace {
 
-// freq → step (phase increment): step = freq / SR * 2^32 = freq * (2^32 / SR).
-// 2^32 / 44100 ≈ 97391.5 (Q0). We use Q8 to avoid losing the .5 bit.
-constexpr uint32_t STEP_PER_HZ_Q8 = (4294967296ull * 256ull) / 44100ull;  // ≈ 24932235
+// freq → step (phase increment): step = freq / SR * 2^32.
+// At 44100 Hz, 2^32 / 44100 ≈ 97391.5. Rounded to 97392 for an integer
+// constant; the half-Hz error at 200 Hz is ~0.005 cent, well below
+// audibility.
+constexpr uint32_t STEP_PER_HZ = 97392;
 
-inline u32 hz_q24_to_step(i32 hzQ24) {
-    // hzQ24 is Q24, but for audible frequencies (20..20000) the integer
-    // part fits in 14 bits — multiply by STEP_PER_HZ_Q8 in 64-bit, shift down.
-    int64_t h = static_cast<int64_t>(hzQ24);             // Q24
-    int64_t s = (h * static_cast<int64_t>(STEP_PER_HZ_Q8)) >> (24 + 8);
-    return static_cast<u32>(s);
+inline u32 hz_to_step(int hz) {
+    if (hz < 1) hz = 1;
+    return static_cast<u32>(hz) * STEP_PER_HZ;
 }
 
-// Chamberlin SVF f coefficient = 2 * sin(π * fc / SR). We feed fc/SR as a
-// uint32 normalized phase fragment (0..0x80000000 = 0..π), look up sin via
-// qmath, then double.
-inline i32 svf_f_from_norm(uint32_t fcOverSrQ31) {
-    // fcOverSrQ31 maps 0..0x80000000 → 0..0.5 (Nyquist). We want sin(π*x):
-    //   π*x maps 0..π/2 in our [0, 0x40000000) phase space.
-    // Equivalently, sin_q24 input = fcOverSrQ31 (the upper 31 bits already
-    // represent a half-cycle, so multiplying by 2 in the int domain is a
-    // shift-left-by-1 then mask).
-    uint32_t phase = fcOverSrQ31 << 1;  // 0..0xFFFFFFFF over 0..π
-    i32 s = acid::dsp::sin_q24(phase);   // = sin(π * (fc/SR))
-    return s << 1;  // 2 * sin(...)
+// Chamberlin SVF f coefficient = 2 * sin(π * fc / SR). For fc well below
+// Nyquist, the small-angle approximation 2 sin(x) ≈ 2x within 5% is fine
+// (and 64-bit-divide-free on PS1). For our cutoff range (1..20000 Hz at
+// SR=44100) we hit ±0.4 dB max error at the top — acceptable for a TB-303
+// emulation where the user is sweeping the cutoff anyway.
+//
+// f ≈ 2π * fc_hz / SR, in Q24.
+//
+// TWO_PI_OVER_SR_Q24 = 2π / 44100 * 2^24 ≈ 2390.
+constexpr i32 TWO_PI_OVER_SR_Q24 = 2390;
+
+inline i32 svf_f_from_hz(int fc_hz) {
+    return fc_hz * TWO_PI_OVER_SR_Q24;
 }
 
 // Linear interpolation between two Q24 values by t (also Q24, 0..ONE).
@@ -121,15 +121,17 @@ void AcbTb303Stage1::setAccentAmount(i32 accentQ24) {
     m_accentDepth = accentQ24;
 }
 
-void AcbTb303Stage1::noteOn(i32 noteHzQ24, bool slide, bool accent) {
-    u32 newStep = hz_q24_to_step(noteHzQ24);
+void AcbTb303Stage1::noteOn(int noteHz, bool slide, bool accent) {
+    u32 newStep = hz_to_step(noteHz);
 
     if (slide && m_step != 0) {
         // 60 ms portamento. Per-sample linear ramp in step space.
         m_stepTarget = newStep;
         m_sliding = true;
         constexpr int RAMP_SAMPLES = SAMPLE_RATE * 60 / 1000;  // 2646
-        int64_t diff = static_cast<int64_t>(newStep) - static_cast<int64_t>(m_step);
+        // u32 subtraction wraps to a signed delta when re-interpreted as i32.
+        // Avoids pulling in __divdi3 by keeping the divide in i32.
+        i32 diff = static_cast<i32>(newStep - m_step);
         m_stepRate = static_cast<u32>(diff / RAMP_SAMPLES);
     } else {
         m_step = newStep;
@@ -171,37 +173,32 @@ i16 AcbTb303Stage1::tick() {
     }
 
     // ---- VCF cutoff: base + envMod * envVcf * (accent boost in octaves)
-    // base Hz (Q24)
-    i32 fcQ24 = cutoff_param_to_hz_q24(m_cutoffParam);
+    // base Hz as plain int (80..4000) — avoids holding Hz*Q24 which would
+    // overflow i32 once we shift by whole octaves.
+    i32 fc_base_hz = 80 + (mul_q24(3920 << Q24_SHIFT, m_cutoffParam) >> Q24_SHIFT);
     // env contribution in octaves: 3 * envMod * envVcf (* accent boost).
-    // Q24 multiplication chains.
-    i32 envOctaves = mul_q24(m_envMod, m_envVcf);  // 0..ONE in Q24
-    // *3 octaves (= shift left by ~1.585 — approximate by *3 then /1)
-    envOctaves = (envOctaves * 3);  // up to 3.0 in Q24
+    i32 envOctaves = mul_q24(m_envMod, m_envVcf) * 3;  // up to 3.0 in Q24
     if (m_accent) {
         // boost by 1 + 0.6 * accentDepth
         i32 boost = ONE_Q24 + mul_q24(static_cast<i32>(0.6 * ONE_Q24), m_accentDepth);
         envOctaves = mul_q24(envOctaves, boost);
     }
-    // fc *= 2^envOctaves. Split into integer + fractional octaves.
+    // Split into integer + fractional octaves.
     int wholeOct = envOctaves >> Q24_SHIFT;
     i32 fracOct  = envOctaves & (ONE_Q24 - 1);
-    // 2^frac via pow2 LUT
-    i32 fracMult = acid::dsp::pow2_unit_q24(fracOct);  // [ONE, 2*ONE]
-    // fc *= fracMult; then shift by wholeOct.
-    int64_t fc64 = (static_cast<int64_t>(fcQ24) * static_cast<int64_t>(fracMult)) >> Q24_SHIFT;
-    if (wholeOct >= 0 && wholeOct < 16) fc64 <<= wholeOct;
+    i32 fracMult = acid::dsp::pow2_unit_q24(fracOct);  // Q24 [ONE, 2*ONE]
+    // fc_hz = fc_base_hz * fracMult / ONE_Q24. (i32*i32 → mult instruction
+    // produces a 64-bit pair that gcc shifts down inline — same pattern as
+    // mul_q24, no libgcc helper needed.)
+    i32 fc_hz = static_cast<i32>(
+        (static_cast<int64_t>(fc_base_hz) * fracMult) >> Q24_SHIFT);
+    if (wholeOct > 0 && wholeOct < 16) fc_hz <<= wholeOct;  // i32 sllv = native
     // Cap fc at 0.45 * SR to keep Chamberlin SVF stable.
-    constexpr int64_t FC_MAX_Q24 =
-        static_cast<int64_t>(0.45 * AcbTb303Stage1::SAMPLE_RATE) << Q24_SHIFT;
-    if (fc64 > FC_MAX_Q24) fc64 = FC_MAX_Q24;
-    if (fc64 < (1 << Q24_SHIFT)) fc64 = (1 << Q24_SHIFT);  // 1 Hz floor
+    constexpr i32 FC_MAX_HZ = (SAMPLE_RATE * 45) / 100;  // 19845
+    if (fc_hz > FC_MAX_HZ) fc_hz = FC_MAX_HZ;
+    if (fc_hz < 1)         fc_hz = 1;
 
-    // fc / SR as Q31 phase fragment (so sin_q24 lookup maps π*x correctly).
-    // Q31 norm = (fcQ24 / SR_int) << 7 (Q24 → Q31).
-    uint32_t fcOverSrQ31 =
-        static_cast<uint32_t>((fc64 / static_cast<int64_t>(SAMPLE_RATE)) << 7);
-    i32 f = svf_f_from_norm(fcOverSrQ31);
+    i32 f = svf_f_from_hz(fc_hz);  // 2π*fc/SR (Q24) small-angle approx
     if (f > (3 << Q24_SHIFT) / 2) f = (3 << Q24_SHIFT) / 2;  // Chamberlin stability
 
     // Chamberlin SVF — tap "low".

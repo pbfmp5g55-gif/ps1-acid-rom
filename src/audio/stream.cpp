@@ -206,18 +206,20 @@ void trigger_tb303_stage1(int noteOffset, bool slide, bool accent) {
     using acid::dsp::i32;
     // A2 = 110 Hz at noteOffset 0. Decompose offset into whole octaves +
     // fractional semitones; use pow2 LUT for the fractional part and a
-    // shift for whole octaves.
-    constexpr i32 BASE_HZ_Q24 = 110 << acid::dsp::Q24_SHIFT;
+    // (32-bit, MIPS-native) shift for whole octaves.
+    constexpr int BASE_HZ = 110;
     int shifted = noteOffset + 12;     // map [-12, +24] → [0, 36]
     int whole_oct = shifted / 12 - 1;  // -1..+2 from the +12 shift
     int frac_semi = shifted % 12;      // 0..11
     i32 fracParam = (static_cast<i32>(frac_semi) << acid::dsp::Q24_SHIFT) / 12;
-    i32 ratio = acid::dsp::pow2_unit_q24(fracParam);  // [ONE, 2*ONE]
-    int64_t hz = (static_cast<int64_t>(BASE_HZ_Q24) * static_cast<int64_t>(ratio))
-                 >> acid::dsp::Q24_SHIFT;
+    i32 ratio = acid::dsp::pow2_unit_q24(fracParam);  // Q24 [ONE, 2*ONE]
+    // BASE_HZ * ratio fits comfortably in 32-bit before the shift down.
+    // Inline 32×32→64 mult + shift is the same pattern as mul_q24.
+    int hz = static_cast<int>(
+        (static_cast<int64_t>(BASE_HZ) * ratio) >> acid::dsp::Q24_SHIFT);
     if (whole_oct > 0)      hz <<=  whole_oct;
     else if (whole_oct < 0) hz >>= -whole_oct;
-    g_tb303_stage1.noteOn(static_cast<i32>(hz), slide, accent);
+    g_tb303_stage1.noteOn(hz, slide, accent);
 }
 
 void set_tb303_stage1_knobs(int cutoff8, int reso8, int envMod8,
