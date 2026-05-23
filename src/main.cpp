@@ -11,7 +11,8 @@
 //
 // Within the active synth (drum machines):
 //   L1 / R1                 previous / next voice
-//   L2 / R2                 step OFF / ON at the cursor
+//   L2                      step toggle at the cursor (active <-> off)
+//   R2                      stick "fine" modifier (hold)
 //   D-pad ←→                step cursor
 //   D-pad ↑↓                KNOB 1 ± (PIT for drums)
 //   Select + L1 / R1        KNOB 2 − / +
@@ -19,13 +20,19 @@
 //   Start                   play / stop
 //   Select (tap, no chord)  chain length cycle
 //
-// On TB-303 synths the same buttons gain per-step note entry, faithful to
-// the original sequencer model:
+// On TB-303 synths the same buttons gain per-step note entry plus live
+// analog-stick filter control (DualShock):
 //   D-pad ↑↓                cursor step note ± 1 semitone
 //   Select + D-pad ↑↓       KNOB 1 ± (CUT)  -- voice-wide
 //   Select + L2             accent toggle on cursor step
 //   Select + R2             slide  toggle on cursor step
 //   Select + △ (Triangle)   randomize current pattern (notes/acc/slide/active)
+//   Left  stick X / Y       live CUT / RES
+//   Right stick X / Y       live ENV / DCY
+//   R2 (hold)               while held, sticks move ~1/4 the speed (fine)
+//
+// We use psyqo::AdvancedPad so we can read the analog sticks; digital pads
+// stay at center (0x80) and the stick contributions are no-ops in deadzone.
 //
 // We deliberately avoid binding to L3 / R3 — those buttons only exist on
 // DualShock (analog-stick clicks). On the original PSX digital pad they
@@ -36,12 +43,12 @@
 // keeps its own 16-step pattern per slot, so swapping voice or synth never
 // loses your work in the others.
 
+#include "psyqo/advancedpad.hh"
 #include "psyqo/application.hh"
 #include "psyqo/font.hh"
 #include "psyqo/gpu.hh"
 #include "psyqo/primitives/rectangles.hh"
 #include "psyqo/scene.hh"
-#include "psyqo/simplepad.hh"
 #include "psyqo/spu.hh"
 
 #include "common/hardware/spu.h"
@@ -312,7 +319,7 @@ class AcidRom final : public psyqo::Application {
 
   public:
     psyqo::Font<> m_font;
-    psyqo::SimplePad m_input;
+    psyqo::AdvancedPad m_input;
     bool m_initialized = false;
 };
 
@@ -385,12 +392,17 @@ void AcidRom::prepare() {
     }
 
     reverb::setup();
+
+    // PollingMode::Fast = poll all ports each vsync. Acid-line wobbling is
+    // latency-sensitive so we eat the CPU cost. AdvancedPad initialization
+    // is recommended from prepare() (unlike SimplePad which needed BIOS to
+    // be active before initialize).
+    m_input.initialize(psyqo::AdvancedPad::PollingMode::Fast);
 }
 
 void AcidRom::createScene() {
     if (!m_initialized) {
         m_font.uploadSystemFont(gpu());
-        m_input.initialize();
         m_initialized = true;
     }
     pushScene(&sequencerScene);
@@ -405,10 +417,11 @@ void SequencerScene::start(StartReason) {
 }
 
 void SequencerScene::handleInput() {
-    using B = psyqo::SimplePad::Button;
+    using B = psyqo::AdvancedPad::Button;
+    using P = psyqo::AdvancedPad::Pad;
     auto &pad = acidRom.m_input;
     auto press = [&](B b) {
-        bool now = pad.isButtonPressed(psyqo::SimplePad::Pad1, b);
+        bool now = pad.isButtonPressed(P::Pad1a, b);
         bool wasDown = (m_prevButtons[0] & (1 << b)) == 0;
         return now && !wasDown;
     };
@@ -416,7 +429,7 @@ void SequencerScene::handleInput() {
     // Select-as-modifier: clear chord flag on press, and figure out whether
     // Select is being held this frame so other handlers can branch. Done
     // before face-button dispatch so synth jumps can be inhibited by chord.
-    bool selectHeld = pad.isButtonPressed(psyqo::SimplePad::Pad1, B::Select);
+    bool selectHeld = pad.isButtonPressed(P::Pad1a, B::Select);
     bool selectWasHeld = (m_prevButtons[0] & (1 << B::Select)) == 0;
     if (selectHeld && !selectWasHeld) m_selectChordFired = false;
 
@@ -457,23 +470,21 @@ void SequencerScene::handleInput() {
     int acidSlot = acidSlotForVoice(v);
     bool isAcid = acidSlot >= 0;
 
-    // L2 / R2: step OFF / ON at cursor by default. On 303 voices, Select
-    // turns L2/R2 into per-step accent / slide toggles.
+    // L2: step toggle at cursor (active <-> off). On 303 voices, Select
+    // turns L2 into the per-step accent toggle.
     if (press(B::L2)) {
         if (selectHeld && isAcid) {
             m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_ACCENT;
             m_selectChordFired = true;
         } else {
-            m_voicePatterns[m_currentPattern][v] &= ~(uint16_t(1) << m_cursorStep);
+            m_voicePatterns[m_currentPattern][v] ^= (uint16_t(1) << m_cursorStep);
         }
     }
-    if (press(B::R2)) {
-        if (selectHeld && isAcid) {
-            m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_SLIDE;
-            m_selectChordFired = true;
-        } else {
-            m_voicePatterns[m_currentPattern][v] |= (uint16_t(1) << m_cursorStep);
-        }
+    // R2: hold-only "fine" modifier for the analog sticks (no edge action).
+    // Select+R2 is still the per-step slide toggle on 303 voices.
+    if (press(B::R2) && selectHeld && isAcid) {
+        m_acidExtras[m_currentPattern][acidSlot][m_cursorStep].flags ^= ACID_SLIDE;
+        m_selectChordFired = true;
     }
 
     // D-pad LR: step cursor (default), or pattern slot prev/next when Select held.
@@ -523,9 +534,33 @@ void SequencerScene::handleInput() {
         m_chainPos = 0;
     }
 
+    // Analog sticks → live knob bumps (303 mode only). DualShock in analog
+    // mode reports center=0x80, edge=0x00/0xFF. Digital pads or analog-LED-off
+    // DualShocks stay parked at 0x80 so the deadzone makes this a no-op.
+    // R2 hold drops the bump speed to ~1/4 for fine adjustments.
+    if (isAcid) {
+        bool r2Held = pad.isButtonPressed(P::Pad1a, B::R2);
+        int divisor = r2Held ? 32 : 8;
+        auto bumpByStick = [&](uint8_t a, uint8_t &target) {
+            int d = static_cast<int>(a) - 0x80;
+            if (d > -0x10 && d < 0x10) return;
+            int s = d / divisor;
+            if (s == 0) s = (d > 0) ? 1 : -1;
+            int n = static_cast<int>(target) + s;
+            if (n < 0) n = 0;
+            if (n > 255) n = 255;
+            target = static_cast<uint8_t>(n);
+        };
+        RowKnobs &k = m_knobs[v];
+        bumpByStick(pad.getAdc(P::Pad1a, 2), k.cutoff);  // LeftJoyX  → CUT
+        bumpByStick(pad.getAdc(P::Pad1a, 3), k.reso);    // LeftJoyY  → RES
+        bumpByStick(pad.getAdc(P::Pad1a, 0), k.envMod);  // RightJoyX → ENV
+        bumpByStick(pad.getAdc(P::Pad1a, 1), k.decay);   // RightJoyY → DCY
+    }
+
     uint16_t bits = 0;
     for (int b = 0; b < 16; ++b) {
-        if (!pad.isButtonPressed(psyqo::SimplePad::Pad1, static_cast<B>(b))) {
+        if (!pad.isButtonPressed(P::Pad1a, static_cast<B>(b))) {
             bits |= (1 << b);
         }
     }
@@ -835,9 +870,12 @@ void SequencerScene::draw() {
     constexpr int KFH   = 48;
     constexpr int KFSTP = 76;
     const KnobSlot *slots = knobSetForSynth(m_currentSynth);
+    const bool acidMode = isAcidSynth(m_currentSynth);
     for (int slot = 0; slot < NUM_KNOBS; ++slot) {
         int x = KFX0 + slot * KFSTP;
-        bool live = (slot == 0 || slot == 1);
+        // On 303 the four sticks drive all four knobs live; on drums only
+        // slot 0 (D-pad UD) and slot 1 (Select+L1/R1) move from input.
+        bool live = acidMode ? true : (slot == 0 || slot == 1);
         psyqo::Color box{{.r = 14, .g = 18, .b = 25}};
         psyqo::Prim::Rectangle outer{box};
         outer.position = {{.x = static_cast<int16_t>(x), .y = KFY}};
@@ -889,8 +927,20 @@ void SequencerScene::draw() {
         acidRom.m_font.print(acidRom.gpu(), b,
                             {{.x = static_cast<int16_t>(x + 28), .y = KFY + 4}}, white);
 
-        // Hint key under the slot for the live ones.
-        if (slot == 0) {
+        // Hint glyph under the slot label. On 303 we label each knob with
+        // its stick axis (LJX/LJY/RJX/RJY); on drums we mark the two slots
+        // that are wired to D-pad / shoulder chords.
+        if (acidMode) {
+            const char *stickHint = "LJX";
+            switch (slot) {
+                case 0: stickHint = "LJX"; break;
+                case 1: stickHint = "LJY"; break;
+                case 2: stickHint = "RJX"; break;
+                case 3: stickHint = "RJY"; break;
+            }
+            acidRom.m_font.print(acidRom.gpu(), stickHint,
+                                {{.x = static_cast<int16_t>(x + KFW - 24), .y = KFY + 4}}, dim);
+        } else if (slot == 0) {
             acidRom.m_font.print(acidRom.gpu(), "UD",
                                 {{.x = static_cast<int16_t>(x + KFW - 16), .y = KFY + 4}}, dim);
         } else if (slot == 1) {
@@ -900,20 +950,20 @@ void SequencerScene::draw() {
     }
 
     // ============ Footer help ============
-    // Help text differs between 303 (note-entry layout) and drums.
+    // Help text differs between 303 (note-entry + sticks) and drums.
     if (isAcidSynth(m_currentSynth)) {
         acidRom.m_font.print(acidRom.gpu(),
-            "XOZS:synth  Q/R:voice  UD:NOTE  LR:cur",
+            "XDZS:syn Q/R:voi UD:note A:tgl LR:cur",
             {{.x = 4, .y = 208}}, dim);
         acidRom.m_font.print(acidRom.gpu(),
-            "A/F:OFF/ON  BS+A:acc  BS+F:sld  BS+/\\:rnd",
+            "BS+A:acc BS+F:sld BS+S:rnd L/RStk:knob",
             {{.x = 4, .y = 220}}, dim);
     } else {
         acidRom.m_font.print(acidRom.gpu(),
-            "XOZS:synth  Q/R:voice  A/F:step OFF/ON",
+            "XDZS:syn Q/R:voi A:step tgl LR:cur UD:k1",
             {{.x = 4, .y = 208}}, dim);
         acidRom.m_font.print(acidRom.gpu(),
-            "LR:cur  UD:k1  BS+QR:k2  BS+LR:pat",
+            "BS+QR:k2 BS+LR:pat Enter:play BS:chain",
             {{.x = 4, .y = 220}}, dim);
     }
 }
