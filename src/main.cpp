@@ -1107,41 +1107,46 @@ void SequencerScene::draw() {
         }
     }
 
-    // ============ Footer help ============
-    // BS now toggles SHIFT (not held). Help shows the action for the
-    // current SHIFT state so the user can read what each button will do.
-    if (isAcidSynth(m_currentSynth)) {
-        if (m_shiftMode) {
-            acidRom.m_font.print(acidRom.gpu(),
-                "[SHF] A:acc F:sld S:rnd LR:pat UD:CUT",
-                {{.x = 4, .y = 208}}, amber);
-            acidRom.m_font.print(acidRom.gpu(),
-                "Q/R:RES Enter:chain  BS:shift off",
-                {{.x = 4, .y = 220}}, dim);
-        } else {
-            acidRom.m_font.print(acidRom.gpu(),
-                "XDZS:syn Q/R:voi UD:note A:tgl LR:cur",
-                {{.x = 4, .y = 208}}, dim);
-            acidRom.m_font.print(acidRom.gpu(),
-                "L/RStk:knob R2:fine Enter:play BS:SHF",
-                {{.x = 4, .y = 220}}, dim);
-        }
-    } else {
-        if (m_shiftMode) {
-            acidRom.m_font.print(acidRom.gpu(),
-                "[SHF] LR:pat Q/R:k2 Enter:chain",
-                {{.x = 4, .y = 208}}, amber);
-            acidRom.m_font.print(acidRom.gpu(),
-                "BS:shift off",
-                {{.x = 4, .y = 220}}, dim);
-        } else {
-            acidRom.m_font.print(acidRom.gpu(),
-                "XDZS:syn Q/R:voi A:step tgl LR:cur",
-                {{.x = 4, .y = 208}}, dim);
-            acidRom.m_font.print(acidRom.gpu(),
-                "UD:k1 Enter:play BS:SHF",
-                {{.x = 4, .y = 220}}, dim);
-        }
+    // ============ DEBUG SPU register overlay ============
+    // Temporarily displaces the footer help. Lets the user (and us)
+    // see whether the streaming channel is actually playing.
+    //   ST = SPU_STATUS (bit 6 = IRQ flag)
+    //   CT = SPU_CTRL   (bit 15 = enable, bit 14 = unmute, bit 6 = IRQ en)
+    //   MV = SPU_VOL_MAIN_LEFT
+    //   CV = SPU_VOICES[16].currentVolume (= live mix gain inside SPU)
+    //   VL = SPU_VOICES[16].volumeLeft   (= our requested vol)
+    //   SA = SPU_VOICES[16].sampleStartAddr
+    {
+        auto hex4 = [](uint16_t v, char *out) {
+            for (int i = 0; i < 4; ++i) {
+                uint8_t n = static_cast<uint8_t>((v >> ((3 - i) * 4)) & 0xF);
+                out[i] = static_cast<char>(n < 10 ? ('0' + n) : ('A' + n - 10));
+            }
+        };
+        constexpr int CH = acid::audio::stream::STREAM_CHANNEL;
+        uint16_t spuStat = SPU_STATUS;
+        uint16_t spuCtrl = SPU_CTRL;
+        uint16_t spuMain = SPU_VOL_MAIN_LEFT;
+        uint16_t cv = SPU_VOICES[CH].currentVolume;
+        uint16_t vl = SPU_VOICES[CH].volumeLeft;
+        uint16_t sa = SPU_VOICES[CH].sampleStartAddr;
+
+        char line[28];
+        line[0]='S';line[1]='T';line[2]=':';
+        hex4(spuStat, line+3); line[7]=' ';
+        line[8]='C';line[9]='T';line[10]=':';
+        hex4(spuCtrl, line+11); line[15]=' ';
+        line[16]='M';line[17]='V';line[18]=':';
+        hex4(spuMain, line+19); line[23]='\0';
+        acidRom.m_font.print(acidRom.gpu(), line, {{.x = 4, .y = 208}}, amber);
+
+        line[0]='C';line[1]='V';line[2]=':';
+        hex4(cv, line+3); line[7]=' ';
+        line[8]='V';line[9]='L';line[10]=':';
+        hex4(vl, line+11); line[15]=' ';
+        line[16]='S';line[17]='A';line[18]=':';
+        hex4(sa, line+19); line[23]='\0';
+        acidRom.m_font.print(acidRom.gpu(), line, {{.x = 4, .y = 220}}, amber);
     }
 }
 
