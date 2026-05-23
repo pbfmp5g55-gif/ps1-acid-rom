@@ -14,6 +14,10 @@ src/voices/acb_tb303_stage1.cpp \
 src/voices/acb_tb303_stage2.cpp \
 src/voices/acb_808_bd.cpp \
 src/voices/acb_808_sd.cpp \
+src/voices/acb_808_tom.cpp \
+src/voices/acb_808_cp.cpp \
+src/voices/acb_909_bd.cpp \
+src/voices/acb_909_sd.cpp \
 
 CXXFLAGS = -std=c++20 -Wall -Isrc
 

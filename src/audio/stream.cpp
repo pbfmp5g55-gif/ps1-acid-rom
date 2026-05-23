@@ -8,6 +8,10 @@
 #include "voices/acb_tb303_stage2.hpp"
 #include "voices/acb_808_bd.hpp"
 #include "voices/acb_808_sd.hpp"
+#include "voices/acb_808_tom.hpp"
+#include "voices/acb_808_cp.hpp"
+#include "voices/acb_909_bd.hpp"
+#include "voices/acb_909_sd.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -81,21 +85,29 @@ void fill_test_sine() {
 // the ACB voice mix through fill_silence-style rendering.
 bool g_test_sine_active = false;
 
-// Phase 3+ live mix. Phase 5 adds 808 BD + SD (voices 0, 1).
+// Phase 3-7 covered: 10 voices live (303×4 + 808 BD/SD/TOM/CP + 909 BD/SD).
 acid::voices::AcbTb303Stage1 g_tb303_stg1_saw;
 acid::voices::AcbTb303Stage1 g_tb303_stg1_sqr;
 acid::voices::AcbTb303Stage2 g_tb303_stg2_saw;
 acid::voices::AcbTb303Stage2 g_tb303_stg2_sqr;
 acid::voices::Acb808Bd       g_808_bd;
 acid::voices::Acb808Sd       g_808_sd;
+acid::voices::Acb808Tom      g_808_tom;
+acid::voices::Acb808Cp       g_808_cp;
+acid::voices::Acb909Bd       g_909_bd;
+acid::voices::Acb909Sd       g_909_sd;
 bool g_voices_initialized = false;
 
 // Which voice indices (in the main NUM_VOICES table) are live in the ACB
 // engine. Toggled per phase; bit set = engine handles, bit clear = SPU.
+// Voice table reminder:
+//   0=BD 1=SD 2=TOM 3=HH 4=CY 5=CP 6=CB 7=SAW 8=SQR 9=BD9 10=SD9
+//   11=SW2 12=SQ2
 constexpr uint32_t LIVE_VOICE_MASK =
-    (1u << 0)  | (1u << 1)  |               // 808 BD, SD
-    (1u << 7)  | (1u << 8)  |               // 303 STG1 SAW, SQR
-    (1u << 11) | (1u << 12);                // 303 STG2 SAW, SQR
+    (1u << 0)  | (1u << 1)  | (1u << 2) | (1u << 5) |       // 808 BD/SD/TOM/CP
+    (1u << 7)  | (1u << 8)  |                                // 303 STG1
+    (1u << 9)  | (1u << 10) |                                // 909 BD/SD
+    (1u << 11) | (1u << 12);                                 // 303 STG2
 
 void ensure_voices_initialized() {
     if (g_voices_initialized) return;
@@ -114,15 +126,20 @@ FillMode g_fillMode = FillMode::Acb;
 void fill_acb_mix() {
     ensure_voices_initialized();
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
-        // 6-voice mix: 4 × TB-303 + 808 BD + 808 SD. >>3 = -18 dB headroom
-        // is more than needed; we'll tighten it once we measure peaks with
-        // a busy pattern in Phase 8.
+        // 10-voice mix. >>3 = -18 dB headroom: at -3 dBFS per voice that
+        // leaves enough margin even with all 10 peaking simultaneously
+        // (unlikely in a typical pattern). Tighten in Phase 8 after CPU
+        // measurements give us the real-world peak budget.
         int32_t s = static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
                     static_cast<int32_t>(g_tb303_stg1_sqr.tick()) +
                     static_cast<int32_t>(g_tb303_stg2_saw.tick()) +
                     static_cast<int32_t>(g_tb303_stg2_sqr.tick()) +
                     static_cast<int32_t>(g_808_bd.tick()) +
-                    static_cast<int32_t>(g_808_sd.tick());
+                    static_cast<int32_t>(g_808_sd.tick()) +
+                    static_cast<int32_t>(g_808_tom.tick()) +
+                    static_cast<int32_t>(g_808_cp.tick()) +
+                    static_cast<int32_t>(g_909_bd.tick()) +
+                    static_cast<int32_t>(g_909_sd.tick());
         s >>= 3;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
@@ -269,8 +286,12 @@ void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
     switch (voiceIdx) {
         case 0:  g_808_bd.trigger(vel); break;
         case 1:  g_808_sd.trigger(vel); break;
+        case 2:  g_808_tom.trigger(vel); break;
+        case 5:  g_808_cp.trigger(vel); break;
         case 7:  g_tb303_stg1_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
         case 8:  g_tb303_stg1_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
+        case 9:  g_909_bd.trigger(vel); break;
+        case 10: g_909_sd.trigger(vel); break;
         case 11: g_tb303_stg2_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
         case 12: g_tb303_stg2_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
     }
@@ -298,8 +319,9 @@ void set_acb_voice_knobs(int voiceIdx, int cutoff8, int reso8, int envMod8,
 
 void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
                         int level8) {
-    (void)level8;  // Level routed through master volume in Phase 8.
     ensure_voices_initialized();
+    // level8 is used by 909 BD (click attack); other voices ignore it
+    // until Phase 8 wires master-volume per voice.
     int pit_clamped = pit < -12 ? -12 : (pit > 12 ? 12 : pit);
     acid::dsp::i32 tuningQ24 = static_cast<acid::dsp::i32>(
         ((pit_clamped + 12) << acid::dsp::Q24_SHIFT) / 24);
@@ -313,8 +335,29 @@ void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
             break;
         case 1:
             g_808_sd.setTuning(tuningQ24);
-            g_808_sd.setSnappy(toneQ24);  // TNE knob doubles as SD snappy
+            g_808_sd.setSnappy(toneQ24);
             g_808_sd.setDecay(decayQ24);
+            break;
+        case 2:
+            g_808_tom.setTuning(tuningQ24);
+            g_808_tom.setTone(toneQ24);
+            g_808_tom.setDecay(decayQ24);
+            break;
+        case 5:
+            g_808_cp.setTuning(tuningQ24);
+            g_808_cp.setDecay(decayQ24);
+            break;
+        case 9:
+            g_909_bd.setTuning(tuningQ24);
+            g_909_bd.setTone(toneQ24);
+            g_909_bd.setDecay(decayQ24);
+            g_909_bd.setAttack(static_cast<acid::dsp::i32>(level8) <<
+                              (acid::dsp::Q24_SHIFT - 8));  // LVL → click amt
+            break;
+        case 10:
+            g_909_sd.setTuning(tuningQ24);
+            g_909_sd.setSnappy(toneQ24);
+            g_909_sd.setDecay(decayQ24);
             break;
     }
 }
