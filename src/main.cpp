@@ -55,6 +55,8 @@
 #include "psyqo/scene.hh"
 #include "psyqo/spu.hh"
 
+#include "audio/stream.hpp"
+
 #include "common/hardware/spu.h"
 
 #include "generated/voice_samples.h"
@@ -525,6 +527,12 @@ void AcidRom::prepare() {
     // is recommended from prepare() (unlike SimplePad which needed BIOS to
     // be active before initialize).
     m_input.initialize(psyqo::AdvancedPad::PollingMode::Fast);
+
+    // ACB live render output path: kick the double-buffered ADPCM stream
+    // on channel 23 with two silent buffers chained A→B→A. Phase 3+ will
+    // fill the buffers with the mixed ACB voice output; for now it's just
+    // silence proving the streaming chain itself doesn't drop frames.
+    acid::audio::stream::initialize();
 }
 
 void AcidRom::createScene() {
@@ -1120,6 +1128,7 @@ void SequencerScene::draw() {
 }
 
 void SequencerScene::frame() {
+    acid::audio::stream::tick();  // ACB stream refill (Phase 2: silent).
     psyqo::Color bg{{.r = 8, .g = 4, .b = 16}};
     acidRom.gpu().clear(bg);
 
@@ -1189,6 +1198,7 @@ static void printBold(const char *s, int16_t x, int16_t y, psyqo::Color c) {
 // 3-second fade-in / hold / fade-out of the "ACID ROM PRODUCTIONS" mark.
 
 void LogoScene::frame() {
+    acid::audio::stream::tick();
     // Pure black background — pretend the TV was off and we just powered on.
     acidRom.gpu().clear({{.r = 0, .g = 0, .b = 0}});
 
@@ -1270,6 +1280,7 @@ static void drawSmiley(int cx, int cy, uint8_t glow) {
 }
 
 void TitleScene::frame() {
+    acid::audio::stream::tick();
     // Background: deep purple to black ramp, with horizontal orange grid.
     auto &g = acidRom.gpu();
     g.clear({{.r = 12, .g = 0, .b = 18}});
@@ -1334,6 +1345,7 @@ void MenuScene::start(StartReason) {
 }
 
 void MenuScene::frame() {
+    acid::audio::stream::tick();
     auto &g = acidRom.gpu();
     g.clear({{.r = 6, .g = 4, .b = 14}});
 
@@ -1390,6 +1402,7 @@ void AboutScene::start(StartReason) {
 }
 
 void AboutScene::frame() {
+    acid::audio::stream::tick();
     auto &g = acidRom.gpu();
     g.clear({{.r = 6, .g = 4, .b = 14}});
 
@@ -1465,6 +1478,7 @@ static uint8_t bumpEq(uint8_t v, int delta) {
 }
 
 void OptionsScene::frame() {
+    acid::audio::stream::tick();
     auto &g = acidRom.gpu();
     g.clear({{.r = 4, .g = 6, .b = 14}});
 
@@ -1682,6 +1696,7 @@ void SoundTestScene::start(StartReason) {
 }
 
 void SoundTestScene::frame() {
+    acid::audio::stream::tick();
     auto &g = acidRom.gpu();
     g.clear({{.r = 4, .g = 6, .b = 14}});
 

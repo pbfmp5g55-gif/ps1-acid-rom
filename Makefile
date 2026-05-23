@@ -9,7 +9,8 @@ TYPE = ps-exe
 
 SRCS = \
 src/main.cpp \
+src/audio/stream.cpp \
 
-CXXFLAGS = -std=c++20 -Wall
+CXXFLAGS = -std=c++20 -Wall -Isrc
 
 include third_party/nugget/psyqo/psyqo.mk
