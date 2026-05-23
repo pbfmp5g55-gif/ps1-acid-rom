@@ -58,16 +58,26 @@ void tick();
 enum class FillMode : uint8_t { Silent, Sine, Acb };
 void set_fill_mode(FillMode m);
 
-// ---- Phase 3 wiring -------------------------------------------------------
-// The streaming engine owns one TB-303 stage 1 instance. The sequencer
-// triggers it from triggerAcidVoice() when the SAW voice fires.
+// ---- Phase 3+ wiring ------------------------------------------------------
+// The streaming engine owns one ACB voice instance per acid sample slot.
+// Voice indices follow the SequencerScene voice table:
+//   7  = TB-303 STG1 SAW
+//   8  = TB-303 STG1 SQR
+//   11 = TB-303 STG2 SAW (sample-only until Phase 4b)
+//   12 = TB-303 STG2 SQR (sample-only until Phase 4b)
 //
 // noteOffset: semitones above/below the base note (A2 ≈ 110 Hz).
-void trigger_tb303_stage1(int noteOffset, bool slide, bool accent);
+void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent);
 
 // Push the SequencerScene knob bank (0..255 uint8_t) down to the voice.
 // Called whenever knobs change so the next note picks up the new params.
-void set_tb303_stage1_knobs(int cutoff8, int reso8, int envMod8,
-                            int decay8, int accent8);
+void set_acb_voice_knobs(int voiceIdx,
+                         int cutoff8, int reso8, int envMod8,
+                         int decay8, int accent8);
+
+// Returns true if `voiceIdx` is currently routed through the live ACB
+// engine (rather than the SPU sample path). The sequencer uses this to
+// decide whether to bypass triggerAcidVoice().
+bool is_voice_live(int voiceIdx);
 
 }  // namespace acid::audio::stream

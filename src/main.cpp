@@ -718,11 +718,12 @@ void SequencerScene::advancePlayback() {
             int slot = acidSlotForVoice(v);
             if (slot >= 0) {
                 const AcidStep &step = m_acidExtras[m_playingPattern][slot][m_playStep];
-                // Phase 3 hybrid: voice 7 (TB-303 STG1 SAW) routes through
-                // the live ACB engine on the streaming channel. All other
-                // voices keep the SPU sample playback path.
-                if (v == 7) {
-                    acid::audio::stream::trigger_tb303_stage1(
+                // Hybrid: voices flagged "live" go through the ACB engine
+                // on the streaming channel; the rest take the SPU sample
+                // playback path. The live mask is owned by audio::stream.
+                if (acid::audio::stream::is_voice_live(v)) {
+                    acid::audio::stream::trigger_acb_voice(
+                        v,
                         static_cast<int>(step.note),
                         (step.flags & ACID_SLIDE)  != 0,
                         (step.flags & ACID_ACCENT) != 0);
@@ -1144,13 +1145,14 @@ void SequencerScene::frame() {
 
     handleInput();
     advancePlayback();
-    // Push the TB-303 STG1 (voice 7) knob bank to the ACB live engine so
-    // the user can hear knobs change in real time. Accent depth is hard-
-    // coded to 0.5 for now — future M will expose it as a 5th knob.
-    {
-        const RowKnobs &k = m_knobs[7];
-        acid::audio::stream::set_tb303_stage1_knobs(
-            k.cutoff, k.reso, k.envMod, k.decay, 128);
+    // Push knob banks to every live ACB voice each frame so the user can
+    // sweep filter / env in real time. Accent depth is hardcoded to 128
+    // (= 0.5) for now — future M will expose it as a knob.
+    for (int v = 0; v < NUM_VOICES; ++v) {
+        if (!acid::audio::stream::is_voice_live(v)) continue;
+        const RowKnobs &k = m_knobs[v];
+        acid::audio::stream::set_acb_voice_knobs(
+            v, k.cutoff, k.reso, k.envMod, k.decay, 128);
     }
     draw();
 

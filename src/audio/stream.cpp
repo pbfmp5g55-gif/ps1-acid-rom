@@ -78,9 +78,22 @@ void fill_test_sine() {
 // the ACB voice mix through fill_silence-style rendering.
 bool g_test_sine_active = false;
 
-// Phase 3: live mix of the ACB-modelled voices. Phase 3 wires only the
-// TB-303 stage 1 (SAW); later phases add more voices and sum them here.
-acid::voices::AcbTb303Stage1 g_tb303_stage1;
+// Phase 3+ live mix. Phase 4a adds the SQR partner so the TB-303 STG1
+// row is fully live. Later phases add stage2 + drums.
+acid::voices::AcbTb303Stage1 g_tb303_stg1_saw;
+acid::voices::AcbTb303Stage1 g_tb303_stg1_sqr;
+bool g_voices_initialized = false;
+
+// Which voice indices (in the main NUM_VOICES table) are live in the ACB
+// engine. Toggled per phase; bit set = engine handles, bit clear = SPU.
+constexpr uint32_t LIVE_VOICE_MASK = (1u << 7) | (1u << 8);
+
+void ensure_voices_initialized() {
+    if (g_voices_initialized) return;
+    g_tb303_stg1_saw.setWave(acid::voices::AcbWave::Saw);
+    g_tb303_stg1_sqr.setWave(acid::voices::AcbWave::Square);
+    g_voices_initialized = true;
+}
 
 // Active fill mode. After Phase 3 we default to ACB so live render kicks
 // in immediately; the OptionsScene can flip the user back to SILENT/SINE
@@ -88,11 +101,15 @@ acid::voices::AcbTb303Stage1 g_tb303_stage1;
 FillMode g_fillMode = FillMode::Acb;
 
 void fill_acb_mix() {
-    using acid::dsp::Q24_SHIFT;
+    ensure_voices_initialized();
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
-        // Phase 3: single voice → directly use its sample. Phase 4+
-        // sums multiple voices here and clamps.
-        int32_t s = g_tb303_stage1.tick();
+        // Sum the active live voices then headroom-shift so two simultaneous
+        // peak signals don't clip. 2-voice mix → >>1 (-6 dB).
+        int32_t s = static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
+                    static_cast<int32_t>(g_tb303_stg1_sqr.tick());
+        s >>= 1;
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
     }
 }
@@ -202,33 +219,58 @@ inline acid::dsp::i32 byte_to_q24(int x8) {
 
 }  // namespace
 
-void trigger_tb303_stage1(int noteOffset, bool slide, bool accent) {
+namespace {
+
+// Pick the voice instance for a given sequencer voice index. nullptr if
+// the voice isn't live in this phase.
+acid::voices::AcbTb303Stage1 *voice_for(int voiceIdx) {
+    switch (voiceIdx) {
+        case 7: return &g_tb303_stg1_saw;
+        case 8: return &g_tb303_stg1_sqr;
+        // 11, 12 → stage2, Phase 4b.
+    }
+    return nullptr;
+}
+
+int note_offset_to_hz(int noteOffset) {
     using acid::dsp::i32;
-    // A2 = 110 Hz at noteOffset 0. Decompose offset into whole octaves +
-    // fractional semitones; use pow2 LUT for the fractional part and a
-    // (32-bit, MIPS-native) shift for whole octaves.
     constexpr int BASE_HZ = 110;
-    int shifted = noteOffset + 12;     // map [-12, +24] → [0, 36]
-    int whole_oct = shifted / 12 - 1;  // -1..+2 from the +12 shift
-    int frac_semi = shifted % 12;      // 0..11
+    int shifted = noteOffset + 12;
+    int whole_oct = shifted / 12 - 1;
+    int frac_semi = shifted % 12;
     i32 fracParam = (static_cast<i32>(frac_semi) << acid::dsp::Q24_SHIFT) / 12;
-    i32 ratio = acid::dsp::pow2_unit_q24(fracParam);  // Q24 [ONE, 2*ONE]
-    // BASE_HZ * ratio fits comfortably in 32-bit before the shift down.
-    // Inline 32×32→64 mult + shift is the same pattern as mul_q24.
+    i32 ratio = acid::dsp::pow2_unit_q24(fracParam);
     int hz = static_cast<int>(
         (static_cast<int64_t>(BASE_HZ) * ratio) >> acid::dsp::Q24_SHIFT);
     if (whole_oct > 0)      hz <<=  whole_oct;
     else if (whole_oct < 0) hz >>= -whole_oct;
-    g_tb303_stage1.noteOn(hz, slide, accent);
+    return hz;
 }
 
-void set_tb303_stage1_knobs(int cutoff8, int reso8, int envMod8,
-                            int decay8, int accent8) {
-    g_tb303_stage1.setCutoff(byte_to_q24(cutoff8));
-    g_tb303_stage1.setResonance(byte_to_q24(reso8));
-    g_tb303_stage1.setEnvMod(byte_to_q24(envMod8));
-    g_tb303_stage1.setDecay(byte_to_q24(decay8));
-    g_tb303_stage1.setAccentAmount(byte_to_q24(accent8));
+}  // namespace
+
+bool is_voice_live(int voiceIdx) {
+    if (voiceIdx < 0 || voiceIdx >= 32) return false;
+    return (LIVE_VOICE_MASK & (1u << voiceIdx)) != 0;
+}
+
+void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
+    ensure_voices_initialized();
+    auto *v = voice_for(voiceIdx);
+    if (!v) return;
+    v->noteOn(note_offset_to_hz(noteOffset), slide, accent);
+}
+
+void set_acb_voice_knobs(int voiceIdx, int cutoff8, int reso8, int envMod8,
+                         int decay8, int accent8) {
+    ensure_voices_initialized();
+    auto *v = voice_for(voiceIdx);
+    if (!v) return;
+    v->setCutoff(byte_to_q24(cutoff8));
+    v->setResonance(byte_to_q24(reso8));
+    v->setEnvMod(byte_to_q24(envMod8));
+    v->setDecay(byte_to_q24(decay8));
+    v->setAccentAmount(byte_to_q24(accent8));
 }
 
 }  // namespace acid::audio::stream
