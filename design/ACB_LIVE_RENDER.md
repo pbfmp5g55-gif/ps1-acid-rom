@@ -302,8 +302,8 @@ design/
 |---|---|---|
 | 1 | M16 Q24 DSP lib | ✅ 2026-05-23 (commit ef43c8c、CI #26324066190 green、ctest all 12 pass、qmath 12/12 内 sin/cos err≤0.001、exp≤0.005、tanh≤0.003、pow2≤0.0005 全て tol 内) |
 | 2 | M17-M18 ADPCM streaming | ✅ 2026-05-23 (commit 89502fe、CI #26324277990 green、SPU channel 23 で double-buffered ADPCM streaming (buffer A/B 各 1024 bytes @ 0x10000/0x10400、A→B chain via LOOP_END\|LOOP_ON flag)、frame 毎 SPU_STATUS bit 6 polling で refill、1 kHz sine 検証音 (qmath::sin_q24 で生成、phase 持ち越し) で耳判定 acceptance) |
-| 3 | M19 TB-303 stage1 live | ⬜ |
-| 4 | M20 残り 303 live | ⬜ |
+| 3 | M19 TB-303 stage1 live | ✅ 2026-05-23 (commit c131513、CI #26324555838 green、`src/voices/acb_tb303_stage1.{hpp,cpp}` integer Q24 版、Chamberlin SVF + DCO + env + accent + 60ms slide、voice 7 (SAW) を ACB live にハイブリッド統合) |
+| 4 | M20-M21 残り 303 live | ✅ 2026-05-23 (M20 commit 6a39287 CI #26324609673 + M21 commit 5695625 CI #26324680521 green、stream API を voice index ベースに統一 + LIVE_VOICE_MASK で bit 7,8,11,12 制御、`acb_tb303_stage2.{hpp,cpp}` ladder integer 版、4 voice mix で -12dB headroom + sat16) |
 | 5 | M21 808 BD/SD live | ⬜ |
 | 6 | M22 808 TOM/CP live | ⬜ |
 | 7 | M23 909 BD/SD live | ⬜ |
