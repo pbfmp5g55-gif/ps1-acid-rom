@@ -1,6 +1,6 @@
 # ACB Live Render on PS1 — Design Doc
 
-**Status**: In progress. Started 2026-05-23 with M16 (Phase 1 kickoff).
+**Status**: 13/13 voice live ✅ 2026-05-23 (Phase 1-7 + 9 完了)。残: Phase 8 統合チューニング (実機 CPU 計測)、Phase 10 最終耳判定。
 **Goal**: PS1 上で全主要 voice (303×2 + 808 + 909 のうち 10 voice) を
 **component-level な ACB (Analog Circuit Behavior) ローポリモデル** で
 **毎サンプル live render** する。Roland TR-8 / System-1 が PC でやってる事を
@@ -307,6 +307,6 @@ design/
 | 5 | M22 808 BD/SD live | ✅ 2026-05-23 (commit 135e6d2、CI #26324862945 green、acb_808_bd + acb_808_sd、drum knob setter API 追加、6 voice mix -18dB) |
 | 6 | M23 808 TOM/CP live | ✅ 2026-05-23 (M23 部分は M24 commit と統合、a1d5f2b) |
 | 7 | M24 909 BD/SD live | ✅ 2026-05-23 (commit a1d5f2b、CI #26324964647 green、4 voice 同時実装 (Tom/CP/909BD/909SD)、909 BD は click 段 + LVL→attack 転用、10 voice mix -18dB headroom) |
-| 8 | M24 統合チューニング | ⬜ |
-| 9 | M25 HH/CY/CB live (optional) | ⬜ |
-| 10 | M26 最終耳判定 + doc 更新 | ⬜ |
+| 8 | M27 統合チューニング | ⬜ (実機 CPU 計測 + headroom 最適化が必要、次セッション) |
+| 9 | M25-M26 HH/CY/CB live | ✅ 2026-05-23 (M25 commit 4fb8bc7 CI #26325052252 + M26 commit 46f240b CI #26325137758 green、CB=T-bridge 流用、HH/CY=6 squares + dual Chamberlin SVF cascade (HPF+BPF) で ZDF-TPT 回避、Chamberlin の安定域 (f+1/Q<2) 内で全 brightness ±0.5oct カバー、13 voice 全 live 達成 LIVE_VOICE_MASK=0x1FFF) |
+| 10 | M28 最終耳判定 + doc 更新 | ⬜ (user 実機判定後) |
