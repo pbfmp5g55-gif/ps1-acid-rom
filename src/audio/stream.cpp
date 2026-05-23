@@ -175,28 +175,28 @@ void render_into_pcm_buf() {
 void initialize() {
     if (g_initialized) return;
 
-    // DEBUG: skip our own encoder, replay the BD voice sample (known good
-    // ADPCM, already uploaded at 0x1100) on channel 23 in a sustain-forever
-    // loop. If this hums (re-triggers / continues), channel 23 + playADPCM
-    // are working and the bug is in our streaming pipeline. If still silent
-    // → channel 23 itself is unreachable in this build.
+    render_into_pcm_buf();
+    encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_A_ADDR);
+    dma_to_spu(SPU_BUFFER_A_ADDR);
+
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     cfg.sampleRate.value = 0x1000;
     cfg.volumeLeft  = 0x3fff;
     cfg.volumeRight = 0x3fff;
     cfg.adsr        = 0x1fffc0ff;
-    psyqo::SPU::playADPCM(STREAM_CHANNEL, 0x1100 / 8, cfg, true);
+    psyqo::SPU::playADPCM(STREAM_CHANNEL,
+                          static_cast<uint16_t>(SPU_BUFFER_A_ADDR), cfg, true);
     SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
-        static_cast<uint16_t>(0x1100 / 8);
+        static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
 
     g_initialized = true;
 }
 
 void tick() {
     if (!g_initialized) return;
-    // DEBUG: streaming refill bypassed while we diagnose whether channel 23
-    // is usable at all.
-    (void)render_into_pcm_buf;
+    render_into_pcm_buf();
+    encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_A_ADDR);
+    dma_to_spu(SPU_BUFFER_A_ADDR);
 }
 
 // ---- Phase 3 public API ---------------------------------------------------

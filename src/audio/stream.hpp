@@ -39,9 +39,10 @@ constexpr int SAMPLES_PER_BUFFER = BLOCKS_PER_BUFFER * SAMPLES_PER_BLOCK;
 constexpr uint32_t SPU_BUFFER_A_ADDR = 0x30000;
 constexpr uint32_t SPU_BUFFER_B_ADDR = SPU_BUFFER_A_ADDR + BYTES_PER_BUFFER;
 
-// We hijack the highest channel for the live mix. The sequencer's 13
-// sample voices are 0..12, so 23 is free.
-constexpr uint8_t  STREAM_CHANNEL = 23;
+// We hijack a channel above the sequencer's 13 sample voices (0..12).
+// Started on 23 (top channel) but pcsx-redux seems unhappy playing
+// looped ADPCM there — moved to 16 to see if a mid-range channel works.
+constexpr uint8_t  STREAM_CHANNEL = 16;
 
 // Initialize SPU streaming. Uploads two silent ADPCM buffers, configures
 // the LOOP flags so the SPU chains A→B→A→B forever, and kicks playback
