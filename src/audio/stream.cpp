@@ -183,18 +183,16 @@ void initialize() {
 
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     cfg.sampleRate.value = 0x1000;
-    cfg.volumeLeft  = 0x7fff;   // +0 dB (max signed-15)
-    cfg.volumeRight = 0x7fff;
+    // PSX SPU vol register: 0x3FFF is the linear-max value, 0x4000..0x7FFF
+    // crosses into sweep-mode territory and (per pcsx-redux behaviour)
+    // ends up quieter, not louder. Use 0x3FFF and leave SPU master alone.
+    cfg.volumeLeft  = 0x3fff;
+    cfg.volumeRight = 0x3fff;
     cfg.adsr        = 0x1fffc0ff;
     psyqo::SPU::playADPCM(STREAM_CHANNEL,
                           static_cast<uint16_t>(SPU_BUFFER_A_ADDR), cfg, true);
     SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
         static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
-
-    // Crank SPU master volume to max — psyqo defaults to 0x3fff (-6 dB)
-    // which made our streaming output sound barely audible.
-    SPU_VOL_MAIN_LEFT  = 0x7fff;
-    SPU_VOL_MAIN_RIGHT = 0x7fff;
 
     g_initialized = true;
 }
