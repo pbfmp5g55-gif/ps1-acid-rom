@@ -24,16 +24,6 @@ namespace acid::audio::stream {
 
 namespace {
 
-// SPU IRQ address register (not in psyqo's wrapper). Setting bit 6 of
-// SPU_CTRL enables IRQ; when the SPU reads the address stored at
-// SPU_RAM_IRQ_ADDR it raises CPU IRQ 9 and latches bit 6 of SPU_STATUS.
-constexpr uint32_t SPU_RAM_IRQ_ADDR_OFS = 0x1f801da4;
-inline volatile uint16_t &SPU_RAM_IRQ_ADDR() {
-    return *reinterpret_cast<volatile uint16_t *>(SPU_RAM_IRQ_ADDR_OFS);
-}
-
-// Active buffer index: 0 = SPU is playing A, refill B next; 1 = vice versa.
-int  g_activeBuf = 0;
 bool g_initialized = false;
 
 // Local PCM scratch — one buffer's worth of 16-bit samples. We encode in
@@ -162,90 +152,56 @@ void dma_to_spu(uint32_t spuAddr) {
 
 }  // namespace
 
-void initialize() {
-    if (g_initialized) return;
+// Simplified design: single buffer A, looped forever via LOOP_END+LOOP_ON
+// with repeat addr = A itself. Every frame we re-render the buffer and
+// DMA-overwrite. The SPU race-glitches at the overwrite point (one ADPCM
+// block, ~635 µs) but stays seamless across rewrites because the voice
+// phase accumulators carry the audio forward correctly.
+//
+// We swapped to this from the IRQ-based double-buffer chain because the
+// previous design stayed silent under pcsx-redux — its SPU emulator may
+// not flag SPU_STATUS bit 6 reliably. Single-buffer/no-IRQ doesn't depend
+// on SPU IRQ behaviour at all.
 
-    // Pre-load both buffers with silence so the SPU has something safe to
-    // play immediately and the chain A→B→A keeps running.
+void render_into_pcm_buf() {
     switch (g_fillMode) {
         case FillMode::Sine:   fill_test_sine(); break;
         case FillMode::Acb:    fill_acb_mix();   break;
         case FillMode::Silent:
         default:               fill_silence();   break;
     }
-    encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
+}
+
+void initialize() {
+    if (g_initialized) return;
+
+    render_into_pcm_buf();
+    // Encode with the buffer pointing at itself so the LOOP_END+LOOP_ON
+    // flag at the last block jumps right back to the beginning.
+    encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_A_ADDR);
     dma_to_spu(SPU_BUFFER_A_ADDR);
-    encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
-    dma_to_spu(SPU_BUFFER_B_ADDR);
 
-    // Configure SPU IRQ to fire at the start of buffer B. When the SPU
-    // crosses that address, bit 6 of SPU_STATUS latches and we know A is
-    // done playing → refill A next. (We flip the IRQ addr on each tick.)
-    SPU_CTRL = SPU_CTRL | (1u << 6);          // IRQ enable
-    SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
-
-    // Kick playback on the stream channel. Sample rate is locked to
-    // BASE_SAMPLE_RATE (44100 Hz native) — anything else would resample
-    // and that's the host renderer's job, not the SPU's.
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     cfg.sampleRate.value = 0x1000;            // 1.0 = 44100 Hz native
     cfg.volumeLeft  = 0x3fff;
     cfg.volumeRight = 0x3fff;
-    cfg.adsr        = 0x1fffc0ff;             // sustain-forever envelope
-    psyqo::SPU::playADPCM(STREAM_CHANNEL, static_cast<uint16_t>(SPU_BUFFER_A_ADDR),
-                          cfg, true);
-    // Override repeat addr to B so A's LOOP_END jumps to B (not back to A).
+    cfg.adsr        = 0x1fffc0ff;             // sustain forever
+    psyqo::SPU::playADPCM(STREAM_CHANNEL,
+                          static_cast<uint16_t>(SPU_BUFFER_A_ADDR), cfg, true);
     SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
-        static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
+        static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
 
-    g_activeBuf = 0;
     g_initialized = true;
 }
 
 void tick() {
     if (!g_initialized) return;
-
-    // Check if SPU crossed the IRQ marker since last tick.
-    if ((SPU_STATUS & (1u << 6)) == 0) return;
-
-    // Acknowledge: clear IRQ enable then re-enable. This is the
-    // documented way to drop the latched status bit without writing it
-    // directly (which is read-only on PSX).
-    SPU_CTRL = SPU_CTRL & ~(1u << 6);
-    SPU_CTRL = SPU_CTRL | (1u << 6);
-
-    // Refill the buffer the SPU just finished. After IRQ at B's start,
-    // A is the one freshly-consumed → refill A and set IRQ to A's start
-    // so the next firing tells us B is consumed.
-    if (g_activeBuf == 0) {
-        // We were playing A, IRQ fired at B start → refill A.
-        switch (g_fillMode) {
-        case FillMode::Sine:   fill_test_sine(); break;
-        case FillMode::Acb:    fill_acb_mix();   break;
-        case FillMode::Silent:
-        default:               fill_silence();   break;
-    }  // Phase 2: silence only.
-        encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
-        // Update repeat addr so the next loop_end in B jumps back to A.
-        SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
-            static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
-        dma_to_spu(SPU_BUFFER_A_ADDR);
-        SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
-        g_activeBuf = 1;
-    } else {
-        switch (g_fillMode) {
-        case FillMode::Sine:   fill_test_sine(); break;
-        case FillMode::Acb:    fill_acb_mix();   break;
-        case FillMode::Silent:
-        default:               fill_silence();   break;
-    }
-        encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
-        SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
-            static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
-        dma_to_spu(SPU_BUFFER_B_ADDR);
-        SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
-        g_activeBuf = 0;
-    }
+    // Every frame: render → encode → DMA-overwrite buffer A. The SPU keeps
+    // looping over the same address and reads whatever we wrote most
+    // recently. No IRQ involved.
+    render_into_pcm_buf();
+    encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_A_ADDR);
+    dma_to_spu(SPU_BUFFER_A_ADDR);
 }
 
 // ---- Phase 3 public API ---------------------------------------------------
