@@ -327,6 +327,53 @@ class AcidRom final : public psyqo::Application {
     bool m_initialized = false;
 };
 
+// ============================================================================
+// Boot flow: LogoScene → TitleScene → MenuScene → (PLAY) SequencerScene
+//                                              ↓ (ABOUT)
+//                                              AboutScene → back to Menu
+// ----------------------------------------------------------------------------
+
+// Forward decl so menu / title can pushScene the sequencer.
+class SequencerScene;
+extern SequencerScene sequencerScene;
+
+class LogoScene final : public psyqo::Scene {
+    void frame() override;
+    uint32_t m_frames = 0;
+};
+
+class TitleScene final : public psyqo::Scene {
+    void start(StartReason) override;
+    void frame() override;
+    uint32_t m_frames = 0;
+    uint16_t m_prevButtons = 0;
+};
+
+class MenuScene final : public psyqo::Scene {
+    void start(StartReason) override;
+    void frame() override;
+    int m_cursor = 0;
+    uint16_t m_prevButtons = 0;
+};
+
+class AboutScene final : public psyqo::Scene {
+    void start(StartReason) override;
+    void frame() override;
+    uint16_t m_prevButtons = 0;
+};
+
+LogoScene  logoScene;
+TitleScene titleScene;
+MenuScene  menuScene;
+AboutScene aboutScene;
+
+// Edge-press helper shared by the menu/title/about scenes.
+namespace edge {
+    using B = psyqo::AdvancedPad::Button;
+    using P = psyqo::AdvancedPad::Pad;
+    inline bool press(uint16_t &prev, B b);
+}
+
 class SequencerScene final : public psyqo::Scene {
     void start(StartReason reason) override;
     void frame() override;
@@ -371,6 +418,10 @@ class SequencerScene final : public psyqo::Scene {
         m_randState = m_randState * 1664525u + 1013904223u;
         return m_randState;
     }
+
+    // start() runs again every time the sequencer is pushed (e.g. after the
+    // user comes back from the About scene), so the seed must guard itself.
+    bool m_seeded = false;
 };
 
 AcidRom acidRom;
@@ -409,10 +460,12 @@ void AcidRom::createScene() {
         m_font.uploadSystemFont(gpu());
         m_initialized = true;
     }
-    pushScene(&sequencerScene);
+    pushScene(&logoScene);
 }
 
 void SequencerScene::start(StartReason) {
+    if (m_seeded) return;  // Don't clobber the user's pattern on re-entry.
+    m_seeded = true;
     // Default seed pattern: a small live-ish groove.
     m_voicePatterns[0][0]  = 0b1000100010001000;  // BD 4-on-the-floor
     m_voicePatterns[0][1]  = 0b0000100000001000;  // SD on backbeat
@@ -1009,6 +1062,287 @@ void SequencerScene::frame() {
     stripeCell(3, 0x00, 0x00, 0x00);
 
     m_frameCounter++;
+}
+
+// ============================================================================
+// Boot flow scenes — Logo / Title / Menu / About
+// ----------------------------------------------------------------------------
+
+bool edge::press(uint16_t &prev, edge::B b) {
+    bool now = acidRom.m_input.isButtonPressed(edge::P::Pad1a, b);
+    bool wasDown = (prev & (1 << b)) == 0;
+    if (now && !wasDown) return true;
+    return false;
+}
+
+// Read all 16 buttons (Pad1a) into a "1=up, 0=down" bitfield, matching the
+// convention used by m_prevButtons throughout the file.
+static inline void snapshotButtons(uint16_t &dest) {
+    auto &pad = acidRom.m_input;
+    uint16_t bits = 0;
+    for (int b = 0; b < 16; ++b) {
+        if (!pad.isButtonPressed(edge::P::Pad1a, static_cast<edge::B>(b))) {
+            bits |= (1 << b);
+        }
+    }
+    dest = bits;
+}
+
+// Render a string in pseudo-bold by stamping it at four 1-pixel offsets. PSX
+// has no font scaler so this is the cheap way to make a "big" title.
+static void printBold(const char *s, int16_t x, int16_t y, psyqo::Color c) {
+    auto &g = acidRom.gpu();
+    for (int dx = 0; dx < 2; ++dx) {
+        for (int dy = 0; dy < 2; ++dy) {
+            acidRom.m_font.print(g, s,
+                {{.x = static_cast<int16_t>(x + dx), .y = static_cast<int16_t>(y + dy)}}, c);
+        }
+    }
+}
+
+// ---- LogoScene ------------------------------------------------------------
+// 3-second fade-in / hold / fade-out of the "ACID ROM PRODUCTIONS" mark.
+
+void LogoScene::frame() {
+    // Pure black background — pretend the TV was off and we just powered on.
+    acidRom.gpu().clear({{.r = 0, .g = 0, .b = 0}});
+
+    constexpr uint32_t FADE_IN_END = 30;
+    constexpr uint32_t HOLD_END    = 120;
+    constexpr uint32_t FADE_OUT_END = 150;
+
+    uint8_t bright;
+    if (m_frames < FADE_IN_END) {
+        bright = static_cast<uint8_t>((m_frames * 255) / FADE_IN_END);
+    } else if (m_frames < HOLD_END) {
+        bright = 255;
+    } else if (m_frames < FADE_OUT_END) {
+        bright = static_cast<uint8_t>(255 - ((m_frames - HOLD_END) * 255) / (FADE_OUT_END - HOLD_END));
+    } else {
+        bright = 0;
+    }
+
+    psyqo::Color mark{{.r = bright, .g = bright, .b = bright}};
+    psyqo::Color sub {{.r = static_cast<uint8_t>(bright * 3 / 4),
+                       .g = static_cast<uint8_t>(bright * 3 / 4),
+                       .b = static_cast<uint8_t>(bright / 2)}};
+
+    // Center-ish layout for 320×240.
+    printBold("ACID ROM PRODUCTIONS", 56, 100, mark);
+    acidRom.m_font.print(acidRom.gpu(),
+        "a synth-from-scratch label", {{.x = 56, .y = 124}}, sub);
+
+    m_frames++;
+    if (m_frames >= FADE_OUT_END) {
+        m_frames = 0;
+        popScene();
+        pushScene(&titleScene);
+    }
+}
+
+// ---- TitleScene -----------------------------------------------------------
+// 1987 acid-house cosplay: orange grid background, big ACID ROM mark, smiley
+// face, and a blinking PRESS START hook.
+
+void TitleScene::start(StartReason) {
+    m_frames = 0;
+    m_prevButtons = 0;
+}
+
+static void drawSmiley(int cx, int cy, uint8_t glow) {
+    auto &g = acidRom.gpu();
+    psyqo::Color yellow{{.r = 240, .g = static_cast<uint8_t>(200 + (glow >> 4)), .b = 30}};
+    psyqo::Color black {{.r = 0, .g = 0, .b = 0}};
+
+    // Filled face: stack of horizontal bars to fake a circle. r=18.
+    static constexpr int8_t WIDTHS[] = {6, 10, 14, 16, 18, 18, 18, 18, 16, 14, 10, 6};
+    for (int i = 0; i < 12; ++i) {
+        int w = WIDTHS[i];
+        psyqo::Prim::Rectangle bar{yellow};
+        bar.position = {{.x = static_cast<int16_t>(cx - w),
+                         .y = static_cast<int16_t>(cy - 18 + i * 3)}};
+        bar.size     = {{.x = static_cast<int16_t>(w * 2), .y = 3}};
+        g.sendPrimitive(bar);
+    }
+    // Eyes.
+    for (int dx : {-7, 7}) {
+        psyqo::Prim::Rectangle eye{black};
+        eye.position = {{.x = static_cast<int16_t>(cx + dx - 2),
+                         .y = static_cast<int16_t>(cy - 5)}};
+        eye.size     = {{.x = 4, .y = 6}};
+        g.sendPrimitive(eye);
+    }
+    // Smile: 3-row arc, narrower at the ends.
+    static constexpr int8_t MOUTH_W[] = {12, 16, 8};
+    static constexpr int8_t MOUTH_OFFY[] = {7, 9, 12};
+    for (int i = 0; i < 3; ++i) {
+        psyqo::Prim::Rectangle m{black};
+        m.position = {{.x = static_cast<int16_t>(cx - MOUTH_W[i]),
+                       .y = static_cast<int16_t>(cy + MOUTH_OFFY[i])}};
+        m.size     = {{.x = static_cast<int16_t>(MOUTH_W[i] * 2), .y = 2}};
+        g.sendPrimitive(m);
+    }
+}
+
+void TitleScene::frame() {
+    // Background: deep purple to black ramp, with horizontal orange grid.
+    auto &g = acidRom.gpu();
+    g.clear({{.r = 12, .g = 0, .b = 18}});
+
+    // Acid-house grid: thin orange lines every 24px, dimming away from center.
+    psyqo::Color grid{{.r = 180, .g = 60, .b = 20}};
+    for (int y = 36; y < 240; y += 24) {
+        psyqo::Prim::Rectangle ln{grid};
+        ln.position = {{.x = 0, .y = static_cast<int16_t>(y)}};
+        ln.size     = {{.x = 320, .y = 1}};
+        g.sendPrimitive(ln);
+    }
+    for (int x = 0; x < 320; x += 24) {
+        psyqo::Prim::Rectangle ln{grid};
+        ln.position = {{.x = static_cast<int16_t>(x), .y = 36}};
+        ln.size     = {{.x = 1, .y = 204}};
+        g.sendPrimitive(ln);
+    }
+
+    // Main title.
+    psyqo::Color amber{{.r = 240, .g = 180, .b = 60}};
+    psyqo::Color hot  {{.r = 255, .g = 100, .b = 40}};
+    printBold("A C I D   R O M", 72, 56, hot);
+    printBold("A C I D   R O M", 72, 56, amber);  // 2nd pass adds glow
+
+    // Smiley center-left, subtitle right.
+    drawSmiley(60, 130, static_cast<uint8_t>(m_frames & 0xFF));
+    acidRom.m_font.print(g, "PHUTURE LIVES",      {{.x = 112, .y = 116}}, amber);
+    acidRom.m_font.print(g, "-- 1987 STYLE --",   {{.x = 112, .y = 130}}, hot);
+    acidRom.m_font.print(g, "by ACID ROM PROD.",  {{.x = 112, .y = 144}},
+                         {{.r = 200, .g = 200, .b = 200}});
+
+    // Blinking PRESS START — 30-frame duty.
+    if ((m_frames / 30) & 1) {
+        printBold("PRESS  START", 96, 188, {{.r = 255, .g = 255, .b = 255}});
+    }
+
+    // Footer credit.
+    acidRom.m_font.print(g, "(c) 2026 a synth from scratch",
+                         {{.x = 56, .y = 222}},
+                         {{.r = 120, .g = 120, .b = 140}});
+
+    // Input: Start advances to menu.
+    if (edge::press(m_prevButtons, edge::B::Start)) {
+        snapshotButtons(m_prevButtons);
+        popScene();
+        pushScene(&menuScene);
+        return;
+    }
+    snapshotButtons(m_prevButtons);
+    m_frames++;
+}
+
+// ---- MenuScene ------------------------------------------------------------
+
+constexpr const char *MENU_ITEMS[3] = {"PLAY", "OPTIONS", "ABOUT"};
+constexpr int MENU_COUNT = 3;
+
+void MenuScene::start(StartReason) {
+    // Keep m_cursor across visits so the user lands where they last were.
+    snapshotButtons(m_prevButtons);
+}
+
+void MenuScene::frame() {
+    auto &g = acidRom.gpu();
+    g.clear({{.r = 6, .g = 4, .b = 14}});
+
+    psyqo::Color white {{.r = 240, .g = 240, .b = 240}};
+    psyqo::Color amber {{.r = 240, .g = 180, .b =  60}};
+    psyqo::Color dim   {{.r =  90, .g = 100, .b = 115}};
+    psyqo::Color hot   {{.r = 255, .g = 100, .b =  40}};
+
+    // Top banner.
+    psyqo::Prim::Rectangle banner{{{.r = 24, .g = 12, .b = 36}}};
+    banner.position = {{.x = 0, .y = 0}};
+    banner.size     = {{.x = 320, .y = 30}};
+    g.sendPrimitive(banner);
+    printBold("ACID ROM", 116, 8, amber);
+
+    // Menu list.
+    int y0 = 80;
+    for (int i = 0; i < MENU_COUNT; ++i) {
+        bool sel = (i == m_cursor);
+        int y = y0 + i * 28;
+        if (sel) {
+            psyqo::Prim::Rectangle bg{{{.r = 40, .g = 20, .b = 12}}};
+            bg.position = {{.x = 80, .y = static_cast<int16_t>(y - 4)}};
+            bg.size     = {{.x = 160, .y = 22}};
+            g.sendPrimitive(bg);
+            acidRom.m_font.print(g, ">", {{.x = 92, .y = static_cast<int16_t>(y + 4)}}, hot);
+        }
+        printBold(MENU_ITEMS[i], 116, y + 4, sel ? amber : dim);
+    }
+
+    // Footer hint.
+    acidRom.m_font.print(g, "UP/DOWN: select   X: confirm",
+                         {{.x = 56, .y = 222}}, dim);
+
+    // Input.
+    using B = edge::B;
+    if (edge::press(m_prevButtons, B::Up))   m_cursor = (m_cursor + MENU_COUNT - 1) % MENU_COUNT;
+    if (edge::press(m_prevButtons, B::Down)) m_cursor = (m_cursor + 1) % MENU_COUNT;
+    if (edge::press(m_prevButtons, B::Cross)) {
+        snapshotButtons(m_prevButtons);
+        switch (m_cursor) {
+            case 0: pushScene(&sequencerScene); return;
+            case 1: /* OPTIONS placeholder — silent for now */ break;
+            case 2: pushScene(&aboutScene); return;
+        }
+    }
+    snapshotButtons(m_prevButtons);
+}
+
+// ---- AboutScene -----------------------------------------------------------
+
+void AboutScene::start(StartReason) {
+    snapshotButtons(m_prevButtons);
+}
+
+void AboutScene::frame() {
+    auto &g = acidRom.gpu();
+    g.clear({{.r = 6, .g = 4, .b = 14}});
+
+    psyqo::Color white {{.r = 240, .g = 240, .b = 240}};
+    psyqo::Color amber {{.r = 240, .g = 180, .b =  60}};
+    psyqo::Color dim   {{.r = 130, .g = 130, .b = 150}};
+    psyqo::Color hot   {{.r = 255, .g = 100, .b =  40}};
+
+    printBold("ABOUT",   24, 24, amber);
+
+    static const char *LINES[] = {
+        "PS1 ACID ROM  v0.1",
+        "",
+        "TB-303 x 2  +  TR-808  +  TR-909",
+        "all voices synthesized from circuit",
+        "models, no factory samples used.",
+        "",
+        "16-step sequencer, 8 patterns, chain,",
+        "per-step note/accent/slide, randomize,",
+        "Sony Hall reverb, DualShock analog.",
+        "",
+        "(c) 2026  ACID ROM PRODUCTIONS",
+        "a synth-from-scratch label",
+    };
+    for (int i = 0; i < (int)(sizeof(LINES) / sizeof(LINES[0])); ++i) {
+        acidRom.m_font.print(g, LINES[i],
+            {{.x = 24, .y = static_cast<int16_t>(60 + i * 12)}},
+            i >= 10 ? hot : white);
+    }
+    acidRom.m_font.print(g, "X / BS: back", {{.x = 24, .y = 222}}, dim);
+
+    using B = edge::B;
+    if (edge::press(m_prevButtons, B::Cross) || edge::press(m_prevButtons, B::Select)) {
+        snapshotButtons(m_prevButtons);
+        popScene();
+        return;
+    }
+    snapshotButtons(m_prevButtons);
 }
 
 int main() { return acidRom.run(); }
