@@ -3,6 +3,8 @@
 #include "audio/stream.hpp"
 #include "audio/adpcm_encode.hpp"
 
+#include "dsp/qmath.hpp"
+
 #include "psyqo/spu.hh"
 
 #include "common/hardware/spu.h"
@@ -50,6 +52,31 @@ void fill_silence() {
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) g_pcmBuf[i] = 0;
 }
 
+// Phase 2 verification: a low-amplitude 1 kHz sine. If the streaming chain
+// is wired correctly, this hums continuously without clicks at every
+// buffer boundary. The phase accumulator persists across buffers so the
+// sine stays phase-continuous.
+//
+// phase_inc = 2^32 * 1000 Hz / 44100 Hz = 97391607 (approx).
+constexpr uint32_t SINE_PHASE_INC_1KHZ = 97391607u;
+uint32_t g_sine_phase = 0;
+
+void fill_test_sine() {
+    using acid::dsp::sin_q24;
+    for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
+        g_sine_phase += SINE_PHASE_INC_1KHZ;
+        // sin_q24 returns Q24 ∈ [-ONE, ONE]. Shift down to fit s16 with
+        // ~−20 dB headroom so it's easy on the ears.
+        int32_t s = sin_q24(g_sine_phase) >> 13;  // ~ ±2048
+        g_pcmBuf[i] = static_cast<int16_t>(s);
+    }
+}
+
+// Phase-2-only switch: while true, fill with the 1 kHz beep so we can
+// verify the streaming chain by ear. Phase 3 will flip this off and route
+// the ACB voice mix through fill_silence-style rendering.
+bool g_test_sine_active = true;
+
 void dma_to_spu(uint32_t spuAddr) {
     psyqo::SPU::dmaWrite(spuAddr, g_encodedBuf,
                          static_cast<uint16_t>(BYTES_PER_BUFFER), 16);
@@ -62,7 +89,7 @@ void initialize() {
 
     // Pre-load both buffers with silence so the SPU has something safe to
     // play immediately and the chain A→B→A keeps running.
-    fill_silence();
+    if (g_test_sine_active) fill_test_sine(); else fill_silence();
     encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
     dma_to_spu(SPU_BUFFER_A_ADDR);
     encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
@@ -109,7 +136,7 @@ void tick() {
     // so the next firing tells us B is consumed.
     if (g_activeBuf == 0) {
         // We were playing A, IRQ fired at B start → refill A.
-        fill_silence();  // Phase 2: silence only.
+        if (g_test_sine_active) fill_test_sine(); else fill_silence();  // Phase 2: silence only.
         encode_current_buffer(SPU_BUFFER_A_ADDR, SPU_BUFFER_B_ADDR);
         // Update repeat addr so the next loop_end in B jumps back to A.
         SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
@@ -118,7 +145,7 @@ void tick() {
         SPU_RAM_IRQ_ADDR() = static_cast<uint16_t>(SPU_BUFFER_A_ADDR / 8);
         g_activeBuf = 1;
     } else {
-        fill_silence();
+        if (g_test_sine_active) fill_test_sine(); else fill_silence();
         encode_current_buffer(SPU_BUFFER_B_ADDR, SPU_BUFFER_A_ADDR);
         SPU_VOICES[STREAM_CHANNEL].sampleRepeatAddr =
             static_cast<uint16_t>(SPU_BUFFER_B_ADDR / 8);
