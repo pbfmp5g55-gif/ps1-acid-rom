@@ -5,6 +5,7 @@
 
 #include "dsp/qmath.hpp"
 #include "voices/acb_tb303_stage1.hpp"
+#include "voices/acb_tb303_stage2.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -78,20 +79,25 @@ void fill_test_sine() {
 // the ACB voice mix through fill_silence-style rendering.
 bool g_test_sine_active = false;
 
-// Phase 3+ live mix. Phase 4a adds the SQR partner so the TB-303 STG1
-// row is fully live. Later phases add stage2 + drums.
+// Phase 3+ live mix. Phase 4 covers all four TB-303 voices (STG1 + STG2,
+// SAW + SQR).
 acid::voices::AcbTb303Stage1 g_tb303_stg1_saw;
 acid::voices::AcbTb303Stage1 g_tb303_stg1_sqr;
+acid::voices::AcbTb303Stage2 g_tb303_stg2_saw;
+acid::voices::AcbTb303Stage2 g_tb303_stg2_sqr;
 bool g_voices_initialized = false;
 
 // Which voice indices (in the main NUM_VOICES table) are live in the ACB
 // engine. Toggled per phase; bit set = engine handles, bit clear = SPU.
-constexpr uint32_t LIVE_VOICE_MASK = (1u << 7) | (1u << 8);
+constexpr uint32_t LIVE_VOICE_MASK =
+    (1u << 7) | (1u << 8) | (1u << 11) | (1u << 12);
 
 void ensure_voices_initialized() {
     if (g_voices_initialized) return;
     g_tb303_stg1_saw.setWave(acid::voices::AcbWave::Saw);
     g_tb303_stg1_sqr.setWave(acid::voices::AcbWave::Square);
+    g_tb303_stg2_saw.setWave(acid::voices::AcbWave::Saw);
+    g_tb303_stg2_sqr.setWave(acid::voices::AcbWave::Square);
     g_voices_initialized = true;
 }
 
@@ -103,11 +109,13 @@ FillMode g_fillMode = FillMode::Acb;
 void fill_acb_mix() {
     ensure_voices_initialized();
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
-        // Sum the active live voices then headroom-shift so two simultaneous
-        // peak signals don't clip. 2-voice mix → >>1 (-6 dB).
+        // 4-voice mix: SAW+SQR for each of STG1 and STG2. >>2 = -12 dB
+        // headroom so four simultaneous peaks don't clip.
         int32_t s = static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
-                    static_cast<int32_t>(g_tb303_stg1_sqr.tick());
-        s >>= 1;
+                    static_cast<int32_t>(g_tb303_stg1_sqr.tick()) +
+                    static_cast<int32_t>(g_tb303_stg2_saw.tick()) +
+                    static_cast<int32_t>(g_tb303_stg2_sqr.tick());
+        s >>= 2;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
@@ -221,17 +229,6 @@ inline acid::dsp::i32 byte_to_q24(int x8) {
 
 namespace {
 
-// Pick the voice instance for a given sequencer voice index. nullptr if
-// the voice isn't live in this phase.
-acid::voices::AcbTb303Stage1 *voice_for(int voiceIdx) {
-    switch (voiceIdx) {
-        case 7: return &g_tb303_stg1_saw;
-        case 8: return &g_tb303_stg1_sqr;
-        // 11, 12 → stage2, Phase 4b.
-    }
-    return nullptr;
-}
-
 int note_offset_to_hz(int noteOffset) {
     using acid::dsp::i32;
     constexpr int BASE_HZ = 110;
@@ -256,21 +253,33 @@ bool is_voice_live(int voiceIdx) {
 
 void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
     ensure_voices_initialized();
-    auto *v = voice_for(voiceIdx);
-    if (!v) return;
-    v->noteOn(note_offset_to_hz(noteOffset), slide, accent);
+    int hz = note_offset_to_hz(noteOffset);
+    switch (voiceIdx) {
+        case 7:  g_tb303_stg1_saw.noteOn(hz, slide, accent); break;
+        case 8:  g_tb303_stg1_sqr.noteOn(hz, slide, accent); break;
+        case 11: g_tb303_stg2_saw.noteOn(hz, slide, accent); break;
+        case 12: g_tb303_stg2_sqr.noteOn(hz, slide, accent); break;
+    }
 }
 
 void set_acb_voice_knobs(int voiceIdx, int cutoff8, int reso8, int envMod8,
                          int decay8, int accent8) {
     ensure_voices_initialized();
-    auto *v = voice_for(voiceIdx);
-    if (!v) return;
-    v->setCutoff(byte_to_q24(cutoff8));
-    v->setResonance(byte_to_q24(reso8));
-    v->setEnvMod(byte_to_q24(envMod8));
-    v->setDecay(byte_to_q24(decay8));
-    v->setAccentAmount(byte_to_q24(accent8));
+    // Both stages share the same knob signature, so a generic lambda
+    // dispatches by voice index without virtual calls.
+    auto apply = [&](auto &v) {
+        v.setCutoff(byte_to_q24(cutoff8));
+        v.setResonance(byte_to_q24(reso8));
+        v.setEnvMod(byte_to_q24(envMod8));
+        v.setDecay(byte_to_q24(decay8));
+        v.setAccentAmount(byte_to_q24(accent8));
+    };
+    switch (voiceIdx) {
+        case 7:  apply(g_tb303_stg1_saw); break;
+        case 8:  apply(g_tb303_stg1_sqr); break;
+        case 11: apply(g_tb303_stg2_saw); break;
+        case 12: apply(g_tb303_stg2_sqr); break;
+    }
 }
 
 }  // namespace acid::audio::stream
