@@ -21,11 +21,15 @@ namespace acid::audio::stream {
 constexpr int SAMPLES_PER_BLOCK = 28;
 constexpr int BYTES_PER_BLOCK   = 16;
 
-// One buffer = N blocks. 64 blocks * 28 samples = 1792 samples per buffer.
-// At BASE_SAMPLE_RATE 44100 Hz that's ~40 ms; one NTSC video frame is ~17ms,
-// so each video frame the CPU has 2 buffers worth of time (~80ms) to make
-// the next refill before underrun.
-constexpr int BLOCKS_PER_BUFFER = 64;
+// One buffer ≈ one NTSC video frame (16.7 ms). Sized so CPU refilling the
+// whole buffer per frame matches SPU consumption per frame — keeps the
+// CPU and SPU from stepping on each other's toes inside the buffer. The
+// previous 64-block (40 ms) buffer caused beat-frequency cancellation
+// between CPU writes and SPU reads (= "uppsura" faint hum).
+//
+// 26 blocks × 28 samples = 728 samples = 16.5 ms at 44100 Hz, which is
+// essentially one NTSC frame.
+constexpr int BLOCKS_PER_BUFFER = 26;
 constexpr int BYTES_PER_BUFFER  = BLOCKS_PER_BUFFER * BYTES_PER_BLOCK;  // 1024
 constexpr int SAMPLES_PER_BUFFER = BLOCKS_PER_BUFFER * SAMPLES_PER_BLOCK;
 
