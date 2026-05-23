@@ -223,10 +223,10 @@ i16 AcbTb303Stage1::tick() {
         m_envVca = m_envVcaTarget;
     }
 
-    // Q24 → i16 with +12 dB boost vs host shift. The filter heavily
+    // Q24 → i16 with +18 dB boost vs host shift. The filter heavily
     // attenuates the saw at low cutoff so we need the headroom to keep
-    // the voice audible in the live mix.
-    i32 scaled = out >> (Q24_SHIFT - 14);
+    // the voice audible. sat16 clamps peaks if filter opens fully.
+    i32 scaled = out >> (Q24_SHIFT - 15);
     return sat16(scaled);
 }
 

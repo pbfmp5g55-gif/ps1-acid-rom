@@ -94,8 +94,8 @@ acid::dsp::i16 Acb808Bd::tick() {
     i32 out = mul_q24(m_band, m_env);
     m_env = mul_q24(m_env, m_envCoeff);
 
-    // Q24 → i16 with ~Q14 headroom (same as host bd_tbridge).
-    i32 scaled = out >> (Q24_SHIFT - 14);
+    // Q24 → i16 with +6 dB boost vs host headroom for live-mix audibility.
+    i32 scaled = out >> (Q24_SHIFT - 15);
     return sat16(scaled);
 }
 

@@ -104,7 +104,7 @@ acid::dsp::i16 Acb808Sd::tick() {
     // Mix.
     i32 out = mul_q24(body, m_bodyGain) + mul_q24(snap, m_snapGain);
 
-    i32 scaled = out >> (Q24_SHIFT - 14);
+    i32 scaled = out >> (Q24_SHIFT - 15);  // +6 dB for live mix
     return sat16(scaled);
 }
 
