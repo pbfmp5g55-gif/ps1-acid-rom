@@ -417,11 +417,21 @@ class OptionsScene final : public psyqo::Scene {
     uint32_t m_frames = 0;
 };
 
-LogoScene    logoScene;
-TitleScene   titleScene;
-MenuScene    menuScene;
-AboutScene   aboutScene;
-OptionsScene optionsScene;
+class SoundTestScene final : public psyqo::Scene {
+    void start(StartReason) override;
+    void frame() override;
+    int m_cursor = 0;
+    uint16_t m_prevButtons = 0;
+    uint32_t m_lastTriggerFrame = 0;
+    uint32_t m_frames = 0;
+};
+
+LogoScene      logoScene;
+TitleScene     titleScene;
+MenuScene      menuScene;
+AboutScene     aboutScene;
+OptionsScene   optionsScene;
+SoundTestScene soundTestScene;
 
 // Edge-press helper shared by the menu/title/about scenes.
 namespace edge {
@@ -454,7 +464,9 @@ class SequencerScene final : public psyqo::Scene {
     int m_chainLength    = 1;
     int m_chainPos       = 0;
     int m_cursorStep     = 0;
-    int m_playStep       = 0;
+    // Initialized to -1 so the very first advancePlayback() lands on step
+    // 0 (and triggers the voices on it) instead of skipping past to step 1.
+    int m_playStep       = -1;
     uint32_t m_frameCounter = 0;
     // Q16 accumulator: ticks +1 per frame, fires advancement when it crosses
     // settings::framesPerStepQ16(). Lets the BPM be a non-integer number
@@ -524,13 +536,20 @@ void AcidRom::createScene() {
 }
 
 void SequencerScene::start(StartReason) {
+    // Re-arm playback timer/cursor every time we enter (e.g. coming back
+    // from menu): pre-load the accumulator so the very first frame of the
+    // scene fires step 0 instead of starting one threshold late.
+    m_stepAccumQ16 = settings::framesPerStepQ16();
+    m_playStep     = -1;
+
     if (m_seeded) return;  // Don't clobber the user's pattern on re-entry.
     m_seeded = true;
-    // Default seed pattern: a small live-ish groove.
-    m_voicePatterns[0][0]  = 0b1000100010001000;  // BD 4-on-the-floor
-    m_voicePatterns[0][1]  = 0b0000100000001000;  // SD on backbeat
-    m_voicePatterns[0][3]  = 0b0101010101010101;  // HH off-eighths
-    m_voicePatterns[0][7]  = 0b0010001000100010;  // SAW (303 STG1) accents
+    // Default seed pattern. Bit 0 = step 1 (leftmost LED), bit 15 = step 16.
+    // BD on the four downbeats (steps 1/5/9/13 → bits 0/4/8/12).
+    m_voicePatterns[0][0]  = 0b0001000100010001;  // BD 4-on-the-floor
+    m_voicePatterns[0][1]  = 0b0001000000010000;  // SD on backbeat (steps 5, 13)
+    m_voicePatterns[0][3]  = 0b1010101010101010;  // HH off-eighths
+    m_voicePatterns[0][7]  = 0b0100010001000100;  // SAW (303 STG1) accents
 }
 
 void SequencerScene::handleInput() {
@@ -1414,15 +1433,16 @@ void AboutScene::frame() {
 // ---- OptionsScene ---------------------------------------------------------
 
 namespace opt {
-    constexpr int ROW_BPM     = 0;
-    constexpr int ROW_REVERB  = 1;
-    constexpr int ROW_EQ_LOW  = 2;
-    constexpr int ROW_EQ_MID  = 3;
-    constexpr int ROW_EQ_HIGH = 4;
-    constexpr int ROW_BACK    = 5;
-    constexpr int ROW_COUNT   = 6;
+    constexpr int ROW_BPM        = 0;
+    constexpr int ROW_REVERB     = 1;
+    constexpr int ROW_EQ_LOW     = 2;
+    constexpr int ROW_EQ_MID     = 3;
+    constexpr int ROW_EQ_HIGH    = 4;
+    constexpr int ROW_SOUND_TEST = 5;
+    constexpr int ROW_BACK       = 6;
+    constexpr int ROW_COUNT      = 7;
     constexpr const char *ROW_LABEL[ROW_COUNT] = {
-        "BPM", "REVERB", "EQ LOW", "EQ MID", "EQ HIGH", "BACK",
+        "BPM", "REVERB", "EQ LOW", "EQ MID", "EQ HIGH", "SOUND TEST", "BACK",
     };
     constexpr int BPM_PRESETS[6] = {60, 80, 100, 120, 140, 160};
 }
@@ -1535,6 +1555,11 @@ void OptionsScene::frame() {
                     sel ? white : dim);
                 break;
             }
+            case opt::ROW_SOUND_TEST: {
+                acidRom.m_font.print(g, "play any voice",
+                    {{.x = VALUE_X, .y = static_cast<int16_t>(y + 4)}}, sel ? cyan : dim);
+                break;
+            }
             case opt::ROW_BACK: {
                 acidRom.m_font.print(g, "X to leave",
                     {{.x = VALUE_X, .y = static_cast<int16_t>(y + 4)}}, sel ? cyan : dim);
@@ -1624,6 +1649,10 @@ void OptionsScene::frame() {
                     clampBpm();
                 }
             }
+        } else if (m_cursor == opt::ROW_SOUND_TEST) {
+            snapshotButtons(m_prevButtons);
+            pushScene(&soundTestScene);
+            return;
         } else if (m_cursor == opt::ROW_BACK) {
             snapshotButtons(m_prevButtons);
             popScene();
@@ -1632,6 +1661,108 @@ void OptionsScene::frame() {
     }
 
     // Triangle = quick exit.
+    if (edge::press(m_prevButtons, B::Triangle)) {
+        snapshotButtons(m_prevButtons);
+        popScene();
+        return;
+    }
+
+    snapshotButtons(m_prevButtons);
+    m_frames++;
+}
+
+// ---- SoundTestScene -------------------------------------------------------
+// Play any of the 13 voices on demand to verify the SPU pipeline. Useful
+// for debugging which voice channels are silent.
+
+void SoundTestScene::start(StartReason) {
+    snapshotButtons(m_prevButtons);
+    m_frames = 0;
+    m_lastTriggerFrame = 0;
+}
+
+void SoundTestScene::frame() {
+    auto &g = acidRom.gpu();
+    g.clear({{.r = 4, .g = 6, .b = 14}});
+
+    psyqo::Color white{{.r = 240, .g = 240, .b = 240}};
+    psyqo::Color amber{{.r = 240, .g = 180, .b =  60}};
+    psyqo::Color dim  {{.r = 110, .g = 120, .b = 140}};
+    psyqo::Color hot  {{.r = 255, .g = 100, .b =  40}};
+    psyqo::Color cyan {{.r =  60, .g = 200, .b = 220}};
+
+    // Banner.
+    psyqo::Prim::Rectangle banner{{{.r = 16, .g = 16, .b = 36}}};
+    banner.position = {{.x = 0, .y = 0}};
+    banner.size     = {{.x = 320, .y = 24}};
+    g.sendPrimitive(banner);
+    printBold("SOUND TEST", 116, 6, amber);
+
+    // 13-voice list. Show voice index, name, and which synth + band it
+    // belongs to, so the user can see "MID voices not playing" patterns.
+    constexpr int LIST_Y0 = 32;
+    constexpr int LIST_H  = 14;
+    for (int v = 0; v < NUM_VOICES; ++v) {
+        int y = LIST_Y0 + v * LIST_H;
+        bool sel = (v == m_cursor);
+        if (sel) {
+            psyqo::Prim::Rectangle bg{{{.r = 36, .g = 18, .b = 12}}};
+            bg.position = {{.x = 8, .y = static_cast<int16_t>(y - 1)}};
+            bg.size     = {{.x = 304, .y = LIST_H }};
+            g.sendPrimitive(bg);
+            acidRom.m_font.print(g, ">", {{.x = 12, .y = static_cast<int16_t>(y + 3)}}, hot);
+        }
+        // index
+        char idx[4];
+        idx[0] = (v < 10) ? ' ' : '1';
+        idx[1] = '0' + static_cast<char>(v % 10);
+        idx[2] = '\0';
+        acidRom.m_font.print(g, idx,
+            {{.x = 28, .y = static_cast<int16_t>(y + 3)}}, sel ? amber : dim);
+        // voice name
+        acidRom.m_font.print(g, g_voices[v].name,
+            {{.x = 56, .y = static_cast<int16_t>(y + 3)}}, sel ? white : dim);
+        // synth tag
+        const char *synTag = (v >= 7 && v <= 8)  ? "303 STG1"
+                           : (v >= 11 && v <= 12)? "303 STG2"
+                           : (v >= 9 && v <= 10) ? "TR-909"
+                                                 : "TR-808";
+        acidRom.m_font.print(g, synTag,
+            {{.x = 110, .y = static_cast<int16_t>(y + 3)}}, sel ? cyan : dim);
+        // band tag
+        const char *bandTag = (VOICE_EQ_BAND[v] == 0) ? "LOW"
+                            : (VOICE_EQ_BAND[v] == 1) ? "MID"
+                                                       : "HIGH";
+        acidRom.m_font.print(g, bandTag,
+            {{.x = 200, .y = static_cast<int16_t>(y + 3)}}, sel ? amber : dim);
+        // "PLAY" indicator while a recent trigger is fresh.
+        if (sel && (m_frames - m_lastTriggerFrame) < 30) {
+            acidRom.m_font.print(g, "PLAY",
+                {{.x = 248, .y = static_cast<int16_t>(y + 3)}}, hot);
+        }
+    }
+
+    acidRom.m_font.print(g, "UP/DOWN voice   X play   /\\ back",
+        {{.x = 24, .y = 222}}, dim);
+
+    using B = edge::B;
+    if (edge::press(m_prevButtons, B::Up))   m_cursor = (m_cursor + NUM_VOICES - 1) % NUM_VOICES;
+    if (edge::press(m_prevButtons, B::Down)) m_cursor = (m_cursor + 1) % NUM_VOICES;
+    if (edge::press(m_prevButtons, B::Cross)) {
+        // Trigger the selected voice with default knobs and zero-offset
+        // note. Acid voices go through triggerAcidVoice() so their per-step
+        // accent/slide flags are also exercised (set to 0 here).
+        RowKnobs dummy{};
+        if (acidSlotForVoice(m_cursor) >= 0) {
+            AcidStep neutral{};
+            triggerAcidVoice(CH_PER_VOICE(m_cursor), m_cursor,
+                             g_voices[m_cursor], dummy, neutral);
+        } else {
+            triggerVoice(CH_PER_VOICE(m_cursor), m_cursor,
+                         g_voices[m_cursor], dummy);
+        }
+        m_lastTriggerFrame = m_frames;
+    }
     if (edge::press(m_prevButtons, B::Triangle)) {
         snapshotButtons(m_prevButtons);
         popScene();
