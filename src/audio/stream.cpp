@@ -262,8 +262,8 @@ bool is_voice_live(int voiceIdx) {
 void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
     ensure_voices_initialized();
     // Drum voices ignore note/slide — accent boosts the velocity instead.
-    constexpr acid::dsp::i32 VEL_NORMAL = (4 * (1 << Q24_SHIFT)) / 5;  // 0.8
-    constexpr acid::dsp::i32 VEL_ACCENT = 1 << Q24_SHIFT;              // 1.0
+    constexpr acid::dsp::i32 VEL_NORMAL = (4 * (1 << acid::dsp::Q24_SHIFT)) / 5;
+    constexpr acid::dsp::i32 VEL_ACCENT = 1 << acid::dsp::Q24_SHIFT;
     acid::dsp::i32 vel = accent ? VEL_ACCENT : VEL_NORMAL;
 
     switch (voiceIdx) {
@@ -302,7 +302,7 @@ void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
     ensure_voices_initialized();
     int pit_clamped = pit < -12 ? -12 : (pit > 12 ? 12 : pit);
     acid::dsp::i32 tuningQ24 = static_cast<acid::dsp::i32>(
-        ((pit_clamped + 12) << Q24_SHIFT) / 24);
+        ((pit_clamped + 12) << acid::dsp::Q24_SHIFT) / 24);
     acid::dsp::i32 toneQ24  = byte_to_q24(tone8);
     acid::dsp::i32 decayQ24 = byte_to_q24(decay8);
     switch (voiceIdx) {
