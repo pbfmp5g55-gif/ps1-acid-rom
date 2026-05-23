@@ -121,10 +121,11 @@ void ensure_voices_initialized() {
     g_voices_initialized = true;
 }
 
-// Active fill mode. After Phase 3 we default to ACB so live render kicks
-// in immediately; the OptionsScene can flip the user back to SILENT/SINE
-// for debugging.
-FillMode g_fillMode = FillMode::Acb;
+// DEBUG: temporarily defaults to Sine so we can verify the streaming chain
+// independently of the ACB voice path. If 1 kHz hum is audible, streaming
+// engine is fine and the issue is in voice trigger / mix; if even sine is
+// silent, the SPU streaming itself isn't working yet.
+FillMode g_fillMode = FillMode::Sine;
 
 void fill_acb_mix() {
     ensure_voices_initialized();
