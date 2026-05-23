@@ -90,7 +90,12 @@ constexpr int PITCH_TABLE_ACID_MAX  = 36;
 constexpr int NUM_VOICES   = 13;
 constexpr int NUM_PATTERNS = 8;
 constexpr int NUM_STEPS    = 16;
-constexpr int FRAMES_PER_STEP = 8;
+// Reference timing only: 60 fps NTSC, 16th note resolution.
+// 120 BPM ≈ 7.5 frames/step. We use a Q16 accumulator so non-integer
+// step rates accumulate without long-term drift.
+constexpr int BPM_MIN     =  60;
+constexpr int BPM_MAX     = 200;
+constexpr int BPM_DEFAULT = 120;
 
 constexpr int NUM_ACID_VOICES = 4;  // 303 STG1 saw+sqr (idx 7,8) + STG2 saw+sqr (idx 11,12)
 
@@ -114,6 +119,41 @@ struct AcidStep {
 };
 constexpr uint8_t ACID_ACCENT = 1u << 0;
 constexpr uint8_t ACID_SLIDE  = 1u << 1;
+
+// ---- Global settings (OptionsScene writes, SequencerScene reads) -----------
+//
+// Voice → EQ band mapping. The PS1 SPU has no per-band filter, so this is
+// really a frequency-aware mixer that scales each voice's per-trigger
+// volume by one of three band gains.
+//   0 = LOW  (BD, Tom, 909 BD)
+//   1 = MID  (SD, CP, CB, all TB-303 stages, 909 SD)
+//   2 = HIGH (HH, CY)
+constexpr uint8_t VOICE_EQ_BAND[NUM_VOICES] = {
+    0, 1, 0, 2, 2, 1, 1, 1, 1, 0, 1, 1, 1,
+};
+
+namespace settings {
+    int     g_bpm          = BPM_DEFAULT;
+    bool    g_reverbMaster = false;
+    uint8_t g_eqLow        = 0xFF;
+    uint8_t g_eqMid        = 0xFF;
+    uint8_t g_eqHigh       = 0xFF;
+
+    inline uint8_t eqGainForVoice(int v) {
+        switch (VOICE_EQ_BAND[v]) {
+            case 0: return g_eqLow;
+            case 1: return g_eqMid;
+            case 2: return g_eqHigh;
+        }
+        return 0xFF;
+    }
+
+    // Q16-fixed "frames per 16th step" derived from the current BPM.
+    // 60 fps NTSC, 16th = 60 * 60 / (BPM * 4) = 900 / BPM frames.
+    inline uint32_t framesPerStepQ16() {
+        return (900u << 16) / static_cast<uint32_t>(g_bpm);
+    }
+}
 
 struct VoiceDef {
     const char *name;
@@ -235,13 +275,14 @@ void uploadVoice(uint32_t spuAddr, const uint8_t *data, unsigned bytes) {
     psyqo::SPU::dmaWrite(spuAddr, data, static_cast<uint16_t>(bytes), 16);
 }
 
-void triggerVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k) {
+void triggerVoice(uint8_t channel, int voiceIdx, const VoiceDef &v, const RowKnobs &k) {
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     int idx = PITCH_TABLE_ZERO + k.pitch;
     if (idx < 0) idx = 0;
     if (idx > 24) idx = 24;
     cfg.sampleRate.value = PITCH_TABLE[idx];
     uint32_t vol = (static_cast<uint32_t>(v.volume) * k.level) / 255;
+    vol = (vol * settings::eqGainForVoice(voiceIdx)) / 255;
     if (vol > 0x7FFF) vol = 0x7FFF;
     cfg.volumeLeft  = static_cast<uint16_t>(vol);
     cfg.volumeRight = static_cast<uint16_t>(vol);
@@ -249,8 +290,8 @@ void triggerVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k) {
     psyqo::SPU::playADPCM(channel, static_cast<uint16_t>(v.spuAddr), cfg, true);
 }
 
-void triggerAcidVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k,
-                      const AcidStep &step) {
+void triggerAcidVoice(uint8_t channel, int voiceIdx, const VoiceDef &v,
+                      const RowKnobs &k, const AcidStep &step) {
     psyqo::SPU::ChannelPlaybackConfig cfg{};
     int idx = PITCH_TABLE_ACID_ZERO + static_cast<int>(step.note);
     if (idx < 0) idx = 0;
@@ -261,6 +302,7 @@ void triggerAcidVoice(uint8_t channel, const VoiceDef &v, const RowKnobs &k,
     if (step.flags & ACID_ACCENT) {
         vol = (vol * 13) / 10;  // +30% on accent
     }
+    vol = (vol * settings::eqGainForVoice(voiceIdx)) / 255;
     if (vol > 0x7FFF) vol = 0x7FFF;
     cfg.volumeLeft  = static_cast<uint16_t>(vol);
     cfg.volumeRight = static_cast<uint16_t>(vol);
@@ -362,10 +404,24 @@ class AboutScene final : public psyqo::Scene {
     uint16_t m_prevButtons = 0;
 };
 
-LogoScene  logoScene;
-TitleScene titleScene;
-MenuScene  menuScene;
-AboutScene aboutScene;
+class OptionsScene final : public psyqo::Scene {
+    void start(StartReason) override;
+    void frame() override;
+    int m_cursor = 0;
+    uint16_t m_prevButtons = 0;
+    // BPM tap-tempo ring buffer of recent press timestamps. We average the
+    // last few intervals once the user has tapped at least 4 times.
+    uint32_t m_tapTimes[4] = {0, 0, 0, 0};
+    int      m_tapHead   = 0;
+    int      m_tapCount  = 0;
+    uint32_t m_frames = 0;
+};
+
+LogoScene    logoScene;
+TitleScene   titleScene;
+MenuScene    menuScene;
+AboutScene   aboutScene;
+OptionsScene optionsScene;
 
 // Edge-press helper shared by the menu/title/about scenes.
 namespace edge {
@@ -400,6 +456,10 @@ class SequencerScene final : public psyqo::Scene {
     int m_cursorStep     = 0;
     int m_playStep       = 0;
     uint32_t m_frameCounter = 0;
+    // Q16 accumulator: ticks +1 per frame, fires advancement when it crosses
+    // settings::framesPerStepQ16(). Lets the BPM be a non-integer number
+    // of frames per step without long-term drift.
+    uint32_t m_stepAccumQ16 = 0;
     bool m_running = true;
 
     RowKnobs m_knobs[NUM_VOICES];
@@ -611,10 +671,16 @@ void SequencerScene::handleInput() {
 
 void SequencerScene::advancePlayback() {
     if (!m_running) return;
-    if ((m_frameCounter % FRAMES_PER_STEP) != 0) return;
 
-    int newStep = (m_frameCounter / FRAMES_PER_STEP) % NUM_STEPS;
-    if (newStep == 0 && m_playStep != 0 && m_chainLength > 1) {
+    // Q16 accumulator: tick +1 each frame, fire on overflow. The threshold
+    // depends on BPM so playback rate is set live from settings::g_bpm.
+    m_stepAccumQ16 += (1u << 16);
+    uint32_t threshold = settings::framesPerStepQ16();
+    if (m_stepAccumQ16 < threshold) return;
+    m_stepAccumQ16 -= threshold;
+
+    int newStep = (m_playStep + 1) % NUM_STEPS;
+    if (newStep == 0 && m_chainLength > 1) {
         m_chainPos = (m_chainPos + 1) % m_chainLength;
     }
     m_playStep = newStep;
@@ -624,10 +690,10 @@ void SequencerScene::advancePlayback() {
         if (m_voicePatterns[m_playingPattern][v] & (uint16_t(1) << m_playStep)) {
             int slot = acidSlotForVoice(v);
             if (slot >= 0) {
-                triggerAcidVoice(CH_PER_VOICE(v), g_voices[v], m_knobs[v],
+                triggerAcidVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v],
                                  m_acidExtras[m_playingPattern][slot][m_playStep]);
             } else {
-                triggerVoice(CH_PER_VOICE(v), g_voices[v], m_knobs[v]);
+                triggerVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v]);
             }
         }
     }
@@ -1291,8 +1357,8 @@ void MenuScene::frame() {
         snapshotButtons(m_prevButtons);
         switch (m_cursor) {
             case 0: pushScene(&sequencerScene); return;
-            case 1: /* OPTIONS placeholder — silent for now */ break;
-            case 2: pushScene(&aboutScene); return;
+            case 1: pushScene(&optionsScene);   return;
+            case 2: pushScene(&aboutScene);     return;
         }
     }
     snapshotButtons(m_prevButtons);
@@ -1343,6 +1409,237 @@ void AboutScene::frame() {
         return;
     }
     snapshotButtons(m_prevButtons);
+}
+
+// ---- OptionsScene ---------------------------------------------------------
+
+namespace opt {
+    constexpr int ROW_BPM     = 0;
+    constexpr int ROW_REVERB  = 1;
+    constexpr int ROW_EQ_LOW  = 2;
+    constexpr int ROW_EQ_MID  = 3;
+    constexpr int ROW_EQ_HIGH = 4;
+    constexpr int ROW_BACK    = 5;
+    constexpr int ROW_COUNT   = 6;
+    constexpr const char *ROW_LABEL[ROW_COUNT] = {
+        "BPM", "REVERB", "EQ LOW", "EQ MID", "EQ HIGH", "BACK",
+    };
+    constexpr int BPM_PRESETS[6] = {60, 80, 100, 120, 140, 160};
+}
+
+void OptionsScene::start(StartReason) {
+    snapshotButtons(m_prevButtons);
+    m_frames = 0;
+}
+
+static void clampBpm() {
+    if (settings::g_bpm < BPM_MIN) settings::g_bpm = BPM_MIN;
+    if (settings::g_bpm > BPM_MAX) settings::g_bpm = BPM_MAX;
+}
+
+static uint8_t bumpEq(uint8_t v, int delta) {
+    int n = static_cast<int>(v) + delta * 0x10;
+    if (n < 0) n = 0;
+    if (n > 255) n = 255;
+    return static_cast<uint8_t>(n);
+}
+
+void OptionsScene::frame() {
+    auto &g = acidRom.gpu();
+    g.clear({{.r = 4, .g = 6, .b = 14}});
+
+    psyqo::Color white {{.r = 240, .g = 240, .b = 240}};
+    psyqo::Color amber {{.r = 240, .g = 180, .b =  60}};
+    psyqo::Color dim   {{.r = 110, .g = 120, .b = 140}};
+    psyqo::Color hot   {{.r = 255, .g = 100, .b =  40}};
+    psyqo::Color cyan  {{.r =  60, .g = 200, .b = 220}};
+
+    // Banner
+    psyqo::Prim::Rectangle banner{{{.r = 16, .g = 16, .b = 36}}};
+    banner.position = {{.x = 0, .y = 0}};
+    banner.size     = {{.x = 320, .y = 26}};
+    g.sendPrimitive(banner);
+    printBold("OPTIONS", 124, 6, amber);
+
+    // Row layout: label on the left, value/slider on the right.
+    constexpr int ROW_Y0  = 40;
+    constexpr int ROW_H   = 24;
+    constexpr int LABEL_X = 24;
+    constexpr int VALUE_X = 130;
+
+    for (int r = 0; r < opt::ROW_COUNT; ++r) {
+        int y = ROW_Y0 + r * ROW_H;
+        bool sel = (r == m_cursor);
+        if (sel) {
+            psyqo::Prim::Rectangle bg{{{.r = 36, .g = 18, .b = 12}}};
+            bg.position = {{.x = 12, .y = static_cast<int16_t>(y - 2)}};
+            bg.size     = {{.x = 296, .y = ROW_H - 4}};
+            g.sendPrimitive(bg);
+            acidRom.m_font.print(g, ">", {{.x = 14, .y = static_cast<int16_t>(y + 4)}}, hot);
+        }
+        psyqo::Color labelCol = sel ? amber : dim;
+        acidRom.m_font.print(g, opt::ROW_LABEL[r],
+                             {{.x = LABEL_X, .y = static_cast<int16_t>(y + 4)}}, labelCol);
+
+        switch (r) {
+            case opt::ROW_BPM: {
+                char b[8];
+                int bpm = settings::g_bpm;
+                b[0] = '[';
+                b[1] = '0' + static_cast<char>((bpm / 100) % 10);
+                b[2] = '0' + static_cast<char>((bpm /  10) % 10);
+                b[3] = '0' + static_cast<char>( bpm        % 10);
+                b[4] = ']'; b[5] = '\0';
+                printBold(b, VALUE_X, y + 2, sel ? white : dim);
+                acidRom.m_font.print(g, "L/R prst, UD nudge, X tap",
+                    {{.x = 178, .y = static_cast<int16_t>(y + 4)}},
+                    sel ? cyan : dim);
+                break;
+            }
+            case opt::ROW_REVERB: {
+                bool on = settings::g_reverbMaster;
+                acidRom.m_font.print(g, on ? "ON" : "OFF",
+                    {{.x = VALUE_X, .y = static_cast<int16_t>(y + 4)}},
+                    on ? amber : dim);
+                acidRom.m_font.print(g, "LR toggle",
+                    {{.x = 200, .y = static_cast<int16_t>(y + 4)}},
+                    sel ? cyan : dim);
+                break;
+            }
+            case opt::ROW_EQ_LOW:
+            case opt::ROW_EQ_MID:
+            case opt::ROW_EQ_HIGH: {
+                uint8_t val = (r == opt::ROW_EQ_LOW)  ? settings::g_eqLow
+                            : (r == opt::ROW_EQ_MID)  ? settings::g_eqMid
+                                                      : settings::g_eqHigh;
+                // 16-cell slider, 1 cell per ~16 units.
+                int filled = (val * 16) / 255;
+                for (int i = 0; i < 16; ++i) {
+                    psyqo::Color cellCol = (i < filled) ? amber
+                                                        : psyqo::Color{{.r = 30, .g = 30, .b = 40}};
+                    psyqo::Prim::Rectangle cell{cellCol};
+                    cell.position = {{.x = static_cast<int16_t>(VALUE_X + i * 8),
+                                      .y = static_cast<int16_t>(y + 4)}};
+                    cell.size     = {{.x = 6, .y = 8}};
+                    g.sendPrimitive(cell);
+                }
+                // numeric percent
+                char buf[5];
+                int pct = (val * 100) / 255;
+                buf[0] = '0' + static_cast<char>((pct / 100) % 10);
+                buf[1] = '0' + static_cast<char>((pct /  10) % 10);
+                buf[2] = '0' + static_cast<char>( pct        % 10);
+                buf[3] = '%'; buf[4] = '\0';
+                acidRom.m_font.print(g, buf,
+                    {{.x = 268, .y = static_cast<int16_t>(y + 4)}},
+                    sel ? white : dim);
+                break;
+            }
+            case opt::ROW_BACK: {
+                acidRom.m_font.print(g, "X to leave",
+                    {{.x = VALUE_X, .y = static_cast<int16_t>(y + 4)}}, sel ? cyan : dim);
+                break;
+            }
+        }
+    }
+
+    acidRom.m_font.print(g, "UP/DOWN row   LR change   X confirm   /\\ back",
+        {{.x = 8, .y = 222}}, dim);
+
+    // -------------------------------------------------------------------
+    // Input
+    using B = edge::B;
+    if (edge::press(m_prevButtons, B::Up))   m_cursor = (m_cursor + opt::ROW_COUNT - 1) % opt::ROW_COUNT;
+    if (edge::press(m_prevButtons, B::Down)) m_cursor = (m_cursor + 1) % opt::ROW_COUNT;
+
+    int dx = 0;
+    if (edge::press(m_prevButtons, B::Left))  dx = -1;
+    if (edge::press(m_prevButtons, B::Right)) dx = +1;
+    if (dx != 0) {
+        switch (m_cursor) {
+            case opt::ROW_BPM:    settings::g_bpm += dx;        clampBpm(); break;
+            case opt::ROW_REVERB: {
+                settings::g_reverbMaster = !settings::g_reverbMaster;
+                // Master toggle also wires every voice's send bit; without
+                // it the global enable would have nothing to mix.
+                for (int vi = 0; vi < NUM_VOICES; ++vi) {
+                    reverb::setVoiceSend(vi, settings::g_reverbMaster);
+                }
+                reverb::setEnabled(settings::g_reverbMaster);
+                break;
+            }
+            case opt::ROW_EQ_LOW:  settings::g_eqLow  = bumpEq(settings::g_eqLow,  dx); break;
+            case opt::ROW_EQ_MID:  settings::g_eqMid  = bumpEq(settings::g_eqMid,  dx); break;
+            case opt::ROW_EQ_HIGH: settings::g_eqHigh = bumpEq(settings::g_eqHigh, dx); break;
+        }
+    }
+
+    // L1/R1 on BPM row cycle through musical presets.
+    if (m_cursor == opt::ROW_BPM) {
+        if (edge::press(m_prevButtons, B::L1)) {
+            for (int i = 5; i >= 0; --i) {
+                if (opt::BPM_PRESETS[i] < settings::g_bpm) {
+                    settings::g_bpm = opt::BPM_PRESETS[i];
+                    break;
+                }
+            }
+        }
+        if (edge::press(m_prevButtons, B::R1)) {
+            for (int i = 0; i < 6; ++i) {
+                if (opt::BPM_PRESETS[i] > settings::g_bpm) {
+                    settings::g_bpm = opt::BPM_PRESETS[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    // X on BPM row: tap tempo. X on BACK row: exit. Otherwise no-op.
+    if (edge::press(m_prevButtons, B::Cross)) {
+        if (m_cursor == opt::ROW_BPM) {
+            // Record the tap; if the last tap was over ~3 seconds ago,
+            // restart the tap chain.
+            constexpr uint32_t TAP_RESET_FRAMES = 180;
+            if (m_tapCount > 0) {
+                uint32_t last = m_tapTimes[(m_tapHead + 4 - 1) & 3];
+                if (m_frames - last > TAP_RESET_FRAMES) m_tapCount = 0;
+            }
+            m_tapTimes[m_tapHead] = m_frames;
+            m_tapHead = (m_tapHead + 1) & 3;
+            if (m_tapCount < 4) ++m_tapCount;
+            // After 2+ taps we can estimate. Average the last (count-1) intervals.
+            if (m_tapCount >= 2) {
+                int n = m_tapCount - 1;
+                uint32_t sum = 0;
+                for (int i = 0; i < n; ++i) {
+                    int a = (m_tapHead + 4 - 1 - i) & 3;
+                    int b = (m_tapHead + 4 - 2 - i) & 3;
+                    sum += (m_tapTimes[a] - m_tapTimes[b]);
+                }
+                uint32_t avgFrames = sum / static_cast<uint32_t>(n);  // frames per quarter
+                if (avgFrames > 0) {
+                    // BPM = 60 fps * 60 sec / avgFramesPerBeat
+                    int bpm = static_cast<int>((60u * 60u) / avgFrames);
+                    settings::g_bpm = bpm;
+                    clampBpm();
+                }
+            }
+        } else if (m_cursor == opt::ROW_BACK) {
+            snapshotButtons(m_prevButtons);
+            popScene();
+            return;
+        }
+    }
+
+    // Triangle = quick exit.
+    if (edge::press(m_prevButtons, B::Triangle)) {
+        snapshotButtons(m_prevButtons);
+        popScene();
+        return;
+    }
+
+    snapshotButtons(m_prevButtons);
+    m_frames++;
 }
 
 int main() { return acidRom.run(); }
