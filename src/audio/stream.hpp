@@ -75,6 +75,11 @@ void set_acb_voice_knobs(int voiceIdx,
                          int cutoff8, int reso8, int envMod8,
                          int decay8, int accent8);
 
+// Drum-flavoured knob setter for the 808/909 voices. `pit` is signed
+// (−12..+12 from the PIT knob) — drum voices interpret it as a tuning
+// nudge rather than a per-step note offset.
+void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8, int level8);
+
 // Returns true if `voiceIdx` is currently routed through the live ACB
 // engine (rather than the SPU sample path). The sequencer uses this to
 // decide whether to bypass triggerAcidVoice().

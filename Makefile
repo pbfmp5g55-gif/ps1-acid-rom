@@ -12,6 +12,8 @@ src/main.cpp \
 src/audio/stream.cpp \
 src/voices/acb_tb303_stage1.cpp \
 src/voices/acb_tb303_stage2.cpp \
+src/voices/acb_808_bd.cpp \
+src/voices/acb_808_sd.cpp \
 
 CXXFLAGS = -std=c++20 -Wall -Isrc
 

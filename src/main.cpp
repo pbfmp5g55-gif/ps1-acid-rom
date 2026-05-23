@@ -731,7 +731,14 @@ void SequencerScene::advancePlayback() {
                     triggerAcidVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v], step);
                 }
             } else {
-                triggerVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v]);
+                // Drum voice (no per-step extras). Live ACB takes precedence
+                // when flagged; accent / slide stay false until we add
+                // per-step drum metadata.
+                if (acid::audio::stream::is_voice_live(v)) {
+                    acid::audio::stream::trigger_acb_voice(v, 0, false, false);
+                } else {
+                    triggerVoice(CH_PER_VOICE(v), v, g_voices[v], m_knobs[v]);
+                }
             }
         }
     }
@@ -1146,13 +1153,19 @@ void SequencerScene::frame() {
     handleInput();
     advancePlayback();
     // Push knob banks to every live ACB voice each frame so the user can
-    // sweep filter / env in real time. Accent depth is hardcoded to 128
-    // (= 0.5) for now — future M will expose it as a knob.
+    // sweep filter / env / tuning in real time. Accent depth on the 303
+    // side is hardcoded to 128 for now — future M will expose it as a 5th
+    // knob.
     for (int v = 0; v < NUM_VOICES; ++v) {
         if (!acid::audio::stream::is_voice_live(v)) continue;
         const RowKnobs &k = m_knobs[v];
-        acid::audio::stream::set_acb_voice_knobs(
-            v, k.cutoff, k.reso, k.envMod, k.decay, 128);
+        if (acidSlotForVoice(v) >= 0) {
+            acid::audio::stream::set_acb_voice_knobs(
+                v, k.cutoff, k.reso, k.envMod, k.decay, 128);
+        } else {
+            acid::audio::stream::set_acb_drum_knobs(
+                v, k.pitch, k.tone, k.decay, k.level);
+        }
     }
     draw();
 

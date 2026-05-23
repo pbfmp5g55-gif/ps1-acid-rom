@@ -6,6 +6,8 @@
 #include "dsp/qmath.hpp"
 #include "voices/acb_tb303_stage1.hpp"
 #include "voices/acb_tb303_stage2.hpp"
+#include "voices/acb_808_bd.hpp"
+#include "voices/acb_808_sd.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -79,18 +81,21 @@ void fill_test_sine() {
 // the ACB voice mix through fill_silence-style rendering.
 bool g_test_sine_active = false;
 
-// Phase 3+ live mix. Phase 4 covers all four TB-303 voices (STG1 + STG2,
-// SAW + SQR).
+// Phase 3+ live mix. Phase 5 adds 808 BD + SD (voices 0, 1).
 acid::voices::AcbTb303Stage1 g_tb303_stg1_saw;
 acid::voices::AcbTb303Stage1 g_tb303_stg1_sqr;
 acid::voices::AcbTb303Stage2 g_tb303_stg2_saw;
 acid::voices::AcbTb303Stage2 g_tb303_stg2_sqr;
+acid::voices::Acb808Bd       g_808_bd;
+acid::voices::Acb808Sd       g_808_sd;
 bool g_voices_initialized = false;
 
 // Which voice indices (in the main NUM_VOICES table) are live in the ACB
 // engine. Toggled per phase; bit set = engine handles, bit clear = SPU.
 constexpr uint32_t LIVE_VOICE_MASK =
-    (1u << 7) | (1u << 8) | (1u << 11) | (1u << 12);
+    (1u << 0)  | (1u << 1)  |               // 808 BD, SD
+    (1u << 7)  | (1u << 8)  |               // 303 STG1 SAW, SQR
+    (1u << 11) | (1u << 12);                // 303 STG2 SAW, SQR
 
 void ensure_voices_initialized() {
     if (g_voices_initialized) return;
@@ -109,13 +114,16 @@ FillMode g_fillMode = FillMode::Acb;
 void fill_acb_mix() {
     ensure_voices_initialized();
     for (int i = 0; i < SAMPLES_PER_BUFFER; ++i) {
-        // 4-voice mix: SAW+SQR for each of STG1 and STG2. >>2 = -12 dB
-        // headroom so four simultaneous peaks don't clip.
+        // 6-voice mix: 4 × TB-303 + 808 BD + 808 SD. >>3 = -18 dB headroom
+        // is more than needed; we'll tighten it once we measure peaks with
+        // a busy pattern in Phase 8.
         int32_t s = static_cast<int32_t>(g_tb303_stg1_saw.tick()) +
                     static_cast<int32_t>(g_tb303_stg1_sqr.tick()) +
                     static_cast<int32_t>(g_tb303_stg2_saw.tick()) +
-                    static_cast<int32_t>(g_tb303_stg2_sqr.tick());
-        s >>= 2;
+                    static_cast<int32_t>(g_tb303_stg2_sqr.tick()) +
+                    static_cast<int32_t>(g_808_bd.tick()) +
+                    static_cast<int32_t>(g_808_sd.tick());
+        s >>= 3;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
         g_pcmBuf[i] = static_cast<int16_t>(s);
@@ -253,12 +261,18 @@ bool is_voice_live(int voiceIdx) {
 
 void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
     ensure_voices_initialized();
-    int hz = note_offset_to_hz(noteOffset);
+    // Drum voices ignore note/slide — accent boosts the velocity instead.
+    constexpr acid::dsp::i32 VEL_NORMAL = (4 * (1 << Q24_SHIFT)) / 5;  // 0.8
+    constexpr acid::dsp::i32 VEL_ACCENT = 1 << Q24_SHIFT;              // 1.0
+    acid::dsp::i32 vel = accent ? VEL_ACCENT : VEL_NORMAL;
+
     switch (voiceIdx) {
-        case 7:  g_tb303_stg1_saw.noteOn(hz, slide, accent); break;
-        case 8:  g_tb303_stg1_sqr.noteOn(hz, slide, accent); break;
-        case 11: g_tb303_stg2_saw.noteOn(hz, slide, accent); break;
-        case 12: g_tb303_stg2_sqr.noteOn(hz, slide, accent); break;
+        case 0:  g_808_bd.trigger(vel); break;
+        case 1:  g_808_sd.trigger(vel); break;
+        case 7:  g_tb303_stg1_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
+        case 8:  g_tb303_stg1_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
+        case 11: g_tb303_stg2_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
+        case 12: g_tb303_stg2_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
     }
 }
 
@@ -279,6 +293,29 @@ void set_acb_voice_knobs(int voiceIdx, int cutoff8, int reso8, int envMod8,
         case 8:  apply(g_tb303_stg1_sqr); break;
         case 11: apply(g_tb303_stg2_saw); break;
         case 12: apply(g_tb303_stg2_sqr); break;
+    }
+}
+
+void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
+                        int level8) {
+    (void)level8;  // Level routed through master volume in Phase 8.
+    ensure_voices_initialized();
+    int pit_clamped = pit < -12 ? -12 : (pit > 12 ? 12 : pit);
+    acid::dsp::i32 tuningQ24 = static_cast<acid::dsp::i32>(
+        ((pit_clamped + 12) << Q24_SHIFT) / 24);
+    acid::dsp::i32 toneQ24  = byte_to_q24(tone8);
+    acid::dsp::i32 decayQ24 = byte_to_q24(decay8);
+    switch (voiceIdx) {
+        case 0:
+            g_808_bd.setTuning(tuningQ24);
+            g_808_bd.setTone(toneQ24);
+            g_808_bd.setDecay(decayQ24);
+            break;
+        case 1:
+            g_808_sd.setTuning(tuningQ24);
+            g_808_sd.setSnappy(toneQ24);  // TNE knob doubles as SD snappy
+            g_808_sd.setDecay(decayQ24);
+            break;
     }
 }
 
