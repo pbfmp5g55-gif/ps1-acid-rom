@@ -19,6 +19,8 @@ src/voices/acb_808_cp.cpp \
 src/voices/acb_909_bd.cpp \
 src/voices/acb_909_sd.cpp \
 src/voices/acb_808_cb.cpp \
+src/voices/acb_808_hh.cpp \
+src/voices/acb_808_cy.cpp \
 
 CXXFLAGS = -std=c++20 -Wall -Isrc
 

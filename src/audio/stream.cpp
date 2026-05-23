@@ -13,6 +13,8 @@
 #include "voices/acb_909_bd.hpp"
 #include "voices/acb_909_sd.hpp"
 #include "voices/acb_808_cb.hpp"
+#include "voices/acb_808_hh.hpp"
+#include "voices/acb_808_cy.hpp"
 
 #include "psyqo/spu.hh"
 
@@ -98,6 +100,8 @@ acid::voices::Acb808Cp       g_808_cp;
 acid::voices::Acb909Bd       g_909_bd;
 acid::voices::Acb909Sd       g_909_sd;
 acid::voices::Acb808Cb       g_808_cb;
+acid::voices::Acb808Hh       g_808_hh;
+acid::voices::Acb808Cy       g_808_cy;
 bool g_voices_initialized = false;
 
 // Which voice indices (in the main NUM_VOICES table) are live in the ACB
@@ -105,11 +109,8 @@ bool g_voices_initialized = false;
 // Voice table reminder:
 //   0=BD 1=SD 2=TOM 3=HH 4=CY 5=CP 6=CB 7=SAW 8=SQR 9=BD9 10=SD9
 //   11=SW2 12=SQ2
-constexpr uint32_t LIVE_VOICE_MASK =
-    (1u << 0)  | (1u << 1)  | (1u << 2) | (1u << 5) | (1u << 6) | // 808 BD/SD/TOM/CP/CB
-    (1u << 7)  | (1u << 8)  |                                // 303 STG1
-    (1u << 9)  | (1u << 10) |                                // 909 BD/SD
-    (1u << 11) | (1u << 12);                                 // 303 STG2
+// All 13 voices live — full ACB engine, no SPU sample fallback path used.
+constexpr uint32_t LIVE_VOICE_MASK = 0x1FFFu;  // bits 0..12 all set
 
 void ensure_voices_initialized() {
     if (g_voices_initialized) return;
@@ -141,8 +142,11 @@ void fill_acb_mix() {
                     static_cast<int32_t>(g_808_tom.tick()) +
                     static_cast<int32_t>(g_808_cp.tick()) +
                     static_cast<int32_t>(g_808_cb.tick()) +
+                    static_cast<int32_t>(g_808_hh.tick()) +
+                    static_cast<int32_t>(g_808_cy.tick()) +
                     static_cast<int32_t>(g_909_bd.tick()) +
                     static_cast<int32_t>(g_909_sd.tick());
+        // 13 voices, >>3 = -18 dB headroom is conservative.
         s >>= 3;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
@@ -291,6 +295,8 @@ void trigger_acb_voice(int voiceIdx, int noteOffset, bool slide, bool accent) {
         case 1:  g_808_sd.trigger(vel); break;
         case 2:  g_808_tom.trigger(vel); break;
         case 5:  g_808_cp.trigger(vel); break;
+        case 3:  g_808_hh.trigger(vel); break;
+        case 4:  g_808_cy.trigger(vel); break;
         case 6:  g_808_cb.trigger(vel); break;
         case 7:  g_tb303_stg1_saw.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
         case 8:  g_tb303_stg1_sqr.noteOn(note_offset_to_hz(noteOffset), slide, accent); break;
@@ -350,6 +356,18 @@ void set_acb_drum_knobs(int voiceIdx, int pit, int tone8, int decay8,
         case 5:
             g_808_cp.setTuning(tuningQ24);
             g_808_cp.setDecay(decayQ24);
+            break;
+        case 3:
+            // HH knobs: pit→tune, tone→brightness, decay→openness.
+            g_808_hh.setTune(tuningQ24);
+            g_808_hh.setBrightness(toneQ24);
+            g_808_hh.setOpenness(decayQ24);
+            break;
+        case 4:
+            // CY: pit→tune, tone→brightness, decay→decay.
+            g_808_cy.setTune(tuningQ24);
+            g_808_cy.setBrightness(toneQ24);
+            g_808_cy.setDecay(decayQ24);
             break;
         case 6:
             g_808_cb.setTuning(tuningQ24);
